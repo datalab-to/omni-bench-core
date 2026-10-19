@@ -1,0 +1,25 @@
+# The tests, on every pull request and every push to main. release.yml runs the same steps before it publishes.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+
+      # A venv, because the runner's Python refuses installs into itself (PEP 668).
+      - name: Install and test
+        run: |
+          uv venv
+          . .venv/bin/activate
+          uv pip install -e ".[hub]"
+          python tests/test_core.py

@@ -1,0 +1,81 @@
+# Publishing to PyPI, when a tag `v<version>` is pushed. The tag must match the version in pyproject.toml, because
+# a version uploaded to PyPI can't be replaced.
+#
+# There is no API token: PyPI trusts this repository and this file (a trusted publisher), and the `id-token`
+# permission below is how the job proves it is them.
+#
+# Running it by hand (workflow_dispatch) is a dry run: it builds, tests and checks, and publishes nothing.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Check the tag against the declared version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          declared=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          tag=${GITHUB_REF_NAME#v}
+          echo "tag=$tag declared=$declared"
+          if [ "$declared" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $declared in pyproject.toml. Bump the version, or move the tag." >&2
+            exit 1
+          fi
+
+      - name: Install and test
+        run: |
+          uv venv
+          . .venv/bin/activate
+          uv pip install -e ".[hub]"
+          python tests/test_core.py
+
+      - run: uv build
+
+      - name: Check the artifacts
+        run: uvx twine check dist/*
+
+      # The files that were built must carry the tag's version too, since PyPI indexes them by it.
+      - name: Check the built version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          ls -l dist
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              *-"$tag"-*.whl|*-"$tag".tar.gz) ;;
+              *) echo "::error::$(basename "$f") is not version $tag" >&2; exit 1 ;;
+            esac
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    # The environment PyPI's trusted publisher names.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
