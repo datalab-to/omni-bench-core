@@ -278,6 +278,9 @@ def test_refused_before_any_call(tmp: Path) -> None:
     refused(adapter.configure, Copy, {"uper": True}, match="did you mean 'upper'")
     refused(adapter.configure, Copy, {"upper": "yes"}, match="takes a bool")
     assert adapter.configure(Copy, {"temperature": 0}) == Copy()
+    assert adapter.configure(Exact, {}) == Exact()
+    refused(adapter.configure, Exact, {"strict": True}, match="exact has no option 'strict'")
+    refused(adapter.configure, Doc, {}, match="an adapter or a scorer")
     assert Copy().folder_name == Copy(temperature=0.0).folder_name != Copy(upper=True).folder_name
     refused(b.plan, [Copy(), Copy()], tmp / "runs", match="more than once")
     refused(b.plan, [Copy()], tmp / "runs", sample=2, suites=["nope"], match="unknown suites")

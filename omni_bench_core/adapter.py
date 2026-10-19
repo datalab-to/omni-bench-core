@@ -6,7 +6,7 @@
 - `Budget` and `PollRetry`: helpers for a call that polls a job until it is done;
 - `predict`: sends one input to one adapter under the shared rules, and returns the row's record;
 - `record` and `reread`: build a record, and read a saved answer again;
-- `configure`: makes an adapter from a config's options, checking them; and
+- `configure`: makes an adapter, or a scorer, from a config's options, checking them; and
 - `retryable`: says whether a recorded failure is worth trying again in a later run.
 """
 
@@ -249,8 +249,8 @@ def reading(what: str) -> Iterator[None]:
                                  ) from None
 
 
-def configure[A: Adapter](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
-    """An instance of `cls` with `options` from a config, checked.
+def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
+    """An instance of `cls`, an adapter or a scorer, with `options` from a config, checked.
 
     It checks three things:
 
@@ -258,8 +258,12 @@ def configure[A: Adapter](cls: type[A], options: Mapping[str, Any] | None = None
       report them as what was asked;
     - a whole number given for a float option becomes a float, so `0` and `0.0` name the same run; and
     - a value of the wrong simple type is refused."""
+    from . import scorer  # deferred: scorer imports this module
+
     options = dict(options or {})
-    errors.check_dataclass(cls, Adapter)
+    if not issubclass(cls, (Adapter, scorer.Scorer)):
+        raise TypeError(f"configure makes an adapter or a scorer, not a {cls.__name__}")
+    errors.check_dataclass(cls, Adapter if issubclass(cls, Adapter) else scorer.Scorer)
     fields = [f.name for f in dataclasses.fields(cls)]
     if unknown := sorted(set(options) - set(fields)):
         near = difflib.get_close_matches(unknown[0], fields, n=1)

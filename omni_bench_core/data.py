@@ -268,12 +268,16 @@ def _inside(path: Any, id: str | None = None) -> bool:
 def _on_hub(dataset: str | Path, manifest: str) -> None:
     """Refuses an `hf://` dataset that has no `manifest`, before downloading gigabytes of it.
 
-    When the Hub doesn't answer, the download goes ahead, and a manifest that really is missing is reported
-    after it."""
+    The Hub answers a private dataset that this machine's token can't read as if it didn't exist, so a dataset
+    the Hub doesn't show is reported as that, not as a missing manifest. When the Hub doesn't answer, the
+    download goes ahead, and a manifest that really is missing is reported after it."""
     if (at := hf_dataset(dataset)) is None: return
     import huggingface_hub
 
     try:
+        if not huggingface_hub.repo_exists(at[0], repo_type="dataset"):
+            raise errors.UsageError(f"the Hugging Face Hub shows no dataset {at[0]}: it doesn't exist, or it is private "
+                                    "and this machine has no token that can read it (set HF_TOKEN)")
         missing = not huggingface_hub.file_exists(at[0], manifest, repo_type="dataset", revision=at[1])
     except OSError:
         missing = False
