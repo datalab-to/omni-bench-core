@@ -102,7 +102,7 @@ class Run:
     def brought(self) -> bool:
         """Whether the folder holds predictions you brought, rather than a run made by predicting. A folder you
         brought has no records, no question and no rows of its own: it is graded over the whole manifest."""
-        return not self.settings().get("provider")
+        return not self.settings().get("system")
 
     def selection(self) -> dict[str, Any]:
         """The choice of rows the run answers (`data.selection`), as its settings.json says: `{}` for every row,
@@ -127,8 +127,8 @@ class Run:
         assert self.system is not None, "only a run with a system predicts"
         self.predictions.mkdir(parents=True, exist_ok=True)
         self.records.mkdir(parents=True, exist_ok=True)
-        write_json(self.folder / "settings.json", {"run": self.name, "provider": self.system.name,
-                                                   "settings": self.system.options(), **question,
+        write_json(self.folder / "settings.json", {"run": self.name, "system": self.system.name,
+                                                   "options": self.system.options(), **question,
                                                    **({"commit": commit} if commit else {}), "timeout_s": timeout})
 
     def record(self, id: str) -> dict[str, Any] | None:
@@ -238,7 +238,7 @@ def folder_name(system: adapter.Adapter, question: Mapping[str, Any]) -> str:
 
     The digest covers every option, not only those that differ from the defaults. Defaults change, and then
     two configurations would share a folder and be averaged into one number."""
-    spelled = json.dumps({"provider": system.name, "settings": system.options(), **question}, sort_keys=True,
+    spelled = json.dumps({"system": system.name, "options": system.options(), **question}, sort_keys=True,
                          default=str)
     return f"{re.sub(r'[^A-Za-z0-9._-]+', '_', system.label)}-{hashlib.sha256(spelled.encode()).hexdigest()[:8]}"
 

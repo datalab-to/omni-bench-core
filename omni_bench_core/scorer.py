@@ -203,7 +203,7 @@ class Scorer[R: data.Row, G, P]:
         out = {}
         for f in dataclasses.fields(self):
             v = getattr(self, f.name)
-            out[f.name] = {"provider": v.name, **v.options()} if isinstance(v, adapter.Adapter) else v
+            out[f.name] = {"system": v.name, **v.options()} if isinstance(v, adapter.Adapter) else v
         return out
 
     def gold(self, row: R) -> G:

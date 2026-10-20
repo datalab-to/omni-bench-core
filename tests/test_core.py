@@ -334,7 +334,7 @@ def test_judge_cached_and_unscored(tmp: Path) -> None:
     # and asks the loose scorer every row for the first time.
     assert JUDGED.count("flaky") == 2 and len(JUDGED) == 7, JUDGED
     assert all(g["scorers"][f]["headline"] == 1.0 for f in (strict, loose)), g
-    assert g["scorers"][strict]["options"] == {"judge": {"provider": "judge", "strict": True}}
+    assert g["scorers"][strict]["options"] == {"judge": {"system": "judge", "strict": True}}
     assert abs(g["scorers"][strict]["judge_usd"] - 0.01) < 1e-9
     JUDGED.clear()
     b.grade(tmp / "runs" / name)

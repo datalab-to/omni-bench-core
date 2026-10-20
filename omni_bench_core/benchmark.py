@@ -280,7 +280,7 @@ def _saved(r: runs.Run, x: data.Row, f: cf.Future, board: progress.Board) -> Bas
     except BaseException as exc:
         if isinstance(exc, Exception) and not isinstance(exc, errors.Stop):
             saved = r.folder / "bugs" / f"{x.id}.txt"
-            runs.write_bug(saved, exc, type(r.system), provider=r.system.name, settings=r.system.options(), row=x.id)
+            runs.write_bug(saved, exc, type(r.system), system=r.system.name, options=r.system.options(), row=x.id)
             return errors.bug(f"predicting {x.id}", exc, type(r.system), saved)
         return exc
     r.save(x.id, rec)

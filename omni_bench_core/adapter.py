@@ -298,7 +298,7 @@ def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict
     - a `Stop`, or an account failure, is raised. It is the same for every row, and if it were recorded it
       would look like a settled answer that no resumed run tries again.
 
-    The record holds `provider`, `settings`, `package` (the adapter's package and version, so answers from two
+    The record holds `system`, `options`, `package` (the adapter's package and version, so answers from two
     versions of an adapter can be told apart), `output` (None on a failure), `raw`, `sent`, `error` (its type,
     status, whether it was transient, and its message), `cost` (with `wall_s` and `attempts`), `job_id`,
     `timeout_s` and `captured_at`.
@@ -351,7 +351,7 @@ def record(a: Adapter, got: Call | None, error: errors.VendorError | None, *, at
     answer. Its `output` is filled in afterwards by `reread`, which `predict` calls when there is an answer."""
     costs = [*spent, *([got.cost] if got is not None else [])]
     p = errors.package(type(a))
-    rec = {"provider": a.name, "settings": a.options(), "package": f"{p[0]} {p[1]}" if p else None,
+    rec = {"system": a.name, "options": a.options(), "package": f"{p[0]} {p[1]}" if p else None,
            "output": None, "raw": None, "sent": None, "error": None,
            "cost": {**Cost.total(costs)._asdict(), "wall_s": wall_s, "attempts": attempts}, "job_id": None,
            "timeout_s": timeout, "captured_at": at}
