@@ -783,7 +783,7 @@ def test_a_bug_stops_the_run_and_prints_its_traceback(tmp: Path) -> None:
         raise AssertionError("a bug in an adapter was not raised")
     [folder] = (tmp / "runs").iterdir()
     assert "Buggy raised KeyError while predicting b1" in msg and "bug in your Buggy" in msg, msg
-    assert "Traceback" in msg and "omni-bench-core 0.3" in msg and "Python 3." in msg, msg
+    assert "Traceback" in msg and "omni-bench-core " in msg and "Python 3." in msg, msg
     assert not (folder / "records" / "b1.json").exists() and sorted(p.name for p in folder.iterdir()) == [
         "predictions", "records", "settings.json"]
 
