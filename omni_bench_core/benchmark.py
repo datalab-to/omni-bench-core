@@ -215,7 +215,7 @@ class Benchmark:
         for name, s in graded.items():
             n = (p := s.get("partial", {})) and p["no_answer"] + p["not_scored"]
             part = f", PARTIAL: {n} unfinished rows counted 0, each a failed line in scores.jsonl" if n else ""
-            log.info("%s %s: headline %.3f (%s); %s, %d failed%s%s", r.name, name, s["headline"], s["headline_is"],
+            log.info("%s %s: headline %s; %s, %d failed%s%s", r.name, name, _headline(s),
                      errors.counted(s["rows"], "row"), s["failed"], spent, part)
         return {"run": r.name, "cost": cost, "scorers": graded}
 
@@ -274,6 +274,16 @@ class Benchmark:
         if missing:
             raise errors.UsageError(f"input files that don't exist: {errors.counted(len(missing), 'row')}, e.g. "
                                     + "; ".join(missing[:3]))
+
+
+def _headline(s: dict[str, Any]) -> str:
+    """A summary's headline as the log line shows it: the scorer's number over the scored rows, times coverage,
+    so a low headline reads as either poor answers or few of them."""
+    if not s["coverage"]: return f"{s['headline']:.3f}: no row was scored"
+    what = s["headline_is"].removesuffix(" × coverage")
+    scored = errors.counted(s["rows"] - s["failed"], "scored row")
+    return (f"{s['headline']:.3f} = {s['headline'] / s['coverage']:.3f} ({what}) on {scored} "
+            f"× coverage {s['coverage']:.3f}")
 
 
 def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: float) -> dict[str, Any]:
