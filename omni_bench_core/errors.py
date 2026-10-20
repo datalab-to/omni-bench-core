@@ -1,20 +1,27 @@
-"""The errors a user can meet, kept apart from our own bugs.
+"""The errors a user can meet, and the one rule that decides what each does:
 
-There are five kinds:
+    A row counts 0 only when code says, on purpose, that the system failed, by raising `SystemFailed`.
+    Any other exception stops the run and prints its traceback.
 
-- `UsageError`: what was asked is wrong, such as a bad option, dataset, manifest or file. Fix it and ask
-  again. `Unfinished` is one: a run graded before every row has an answer and a score;
-- `Stop`: the run can't go on, and the reason is the same for every row, such as an account that can't
-  pay, a missing key or a missing dependency. Fix it and run again;
-- `Bug`: an adapter or a scorer raised something that is neither an answer nor a known failure. The run
-  stops, the traceback is saved, and the message says whose code it is and where to report it;
-- `VendorError`: one call to a system failed. It is recorded as that row's answer, which counts as 0. It
-  is retried first when it is `transient`; and
-- `Unscored`: a scorer couldn't score one row, for a reason that isn't the system's fault. Grading isn't
-  finished until a later grading scores it.
+So:
 
-This module also has helpers: `counted` writes a count in a message, `check_dataclass` refuses an adapter,
-scorer or task that forgot its dataclass decorator, and `package` and `bug` say whose code a class is.
+- `SystemFailed` (and its kinds `SystemTimeout`, `SystemUnreachable`, `Unreadable`): the system failed on
+  one row. The row's record keeps it, with its traceback, and the row counts 0; the run goes on. A transient
+  one (a 429, a 5xx) is retried first;
+- `Unscored`: a scorer couldn't score one row for a reason that isn't the system's (a judge that didn't
+  answer). Grading isn't finished until a later grading scores it;
+- `UsageError`: what was asked is wrong (an option, a dataset, a file). `Unfinished` is one: a run graded
+  before every row has an answer and a score;
+- `Stop`: the run can't go on for any row (an account, a key, a server, a missing dependency); and
+- `Bug`: any other exception, which is a bug in the code that raised it. The message says whose code it is,
+  where to report it, and has the whole traceback.
+
+A stop of any kind keeps every answer that was paid for, so running the same command again after the fix
+costs nothing for the rows already done.
+
+This module also has helpers: `counted` writes a count in a message, `capped` cuts a message written to a
+file, `check_dataclass` refuses an adapter, scorer or task that forgot its dataclass decorator, and `package`
+and `bug` say whose code a class is.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from typing import Any
 # of the same condition once drifted apart, and 91 predictions were never retried while 18 identical ones
 # were.
 TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+CAP = 4000   # the most characters of a message or traceback written to a file
 
 
 class UsageError(ValueError):
@@ -69,14 +77,32 @@ class MissingDependency(ImportError, Stop):
     """An adapter could not import a package it needs."""
 
 
+class Unread(Exception):
+    """`Adapter.read` raised something other than `SystemFailed`: a bug in `read`. It carries the row's record,
+    with the system's raw answer and no output, so the answer is saved before the run stops; running the same
+    command again reads it again with the fixed `read`, with no call."""
+
+    def __init__(self, record: dict[str, Any]):
+        super().__init__(record)   # Note: the record is its one argument, so it survives being sent between processes
+        self.record = record
+
+    def __str__(self) -> str:
+        return "read raised; the answer is kept unread"
+
+
 class Bug(Stop):
     """An adapter or a scorer raised something that is neither an answer nor a failure we know of: a bug in
     its code, not a failure of the system. The message says whose code it is and where its traceback was
     saved (`bug`)."""
 
 
-class VendorError(RuntimeError):
-    """A call to a system was made and gave no answer.
+class SystemFailed(RuntimeError):
+    """The system failed on this row: raise it, on purpose, to record the row's failure, which counts 0.
+
+    It is the only exception that counts a row as 0. Raise it in `Adapter.call` for a refusal, an error
+    status, or an answer you can see is unusable; in `Adapter.read` for an answer that can't be read; and in
+    `Scorer.prediction` for an output a scorer can't use. `adapter.reading` raises it for you. The row's
+    record keeps its message and traceback, so it is always clear which line decided the system failed.
 
     It carries what the row's record should keep about the failed call:
 
@@ -103,7 +129,7 @@ class VendorError(RuntimeError):
         return self.status in TRANSIENT_STATUSES
 
 
-class VendorTimeout(VendorError):
+class SystemTimeout(SystemFailed):
     """The row's time ran out while the system was still working.
 
     It is not retried within the same call, because a retry would spend a second budget on a row we know
@@ -114,7 +140,7 @@ class VendorTimeout(VendorError):
         return False
 
 
-class VendorUnreachable(VendorError):
+class SystemUnreachable(SystemFailed):
     """The system couldn't be reached, or its answer never came back.
 
     It is not retried within the same call. A failed poll can leave the job running at the system, and
@@ -125,15 +151,20 @@ class VendorUnreachable(VendorError):
         return False
 
 
-class ReadError(VendorError):
-    """The system answered, but `Adapter.read` couldn't read the answer.
-
-    The raw answer is kept in the record. After the reader is fixed, the answer is read again without a
-    new call."""
+class Unreadable(SystemFailed):
+    """The system answered, but its answer can't be read: `Adapter.read` raised `SystemFailed`. The raw answer
+    is kept in the record, so a fix to `read` reads it again without a new call (`Benchmark.reread`)."""
 
     @property
     def transient(self) -> bool:
         return False
+
+
+def capped(text: str) -> str:
+    """`text`, cut to `CAP` characters when it is written to a file (a record, a line of scores.jsonl). It is the
+    one place a message is cut: a vendor's error can quote a whole web page, which the record keeps in `raw`
+    anyway, and a message is never cut where it is raised."""
+    return text if len(text) <= CAP else text[:CAP] + f"... ({len(text) - CAP} more characters)"
 
 
 def counted(n: int, noun: str) -> str:
@@ -201,7 +232,7 @@ def bug(what: str, exc: BaseException, cls: type) -> Bug:
     import platform
     import traceback
 
-    head = f"{cls.__name__} raised {type(exc).__name__} while {what}: {str(exc)[:200]}"
+    head = f"{cls.__name__} raised {type(exc).__name__} while {what}: {exc}"
     if (p := package(cls)) is not None:
         name, version, home = p
         where = f"report it at {home}/issues" if home else f"report it to {name}'s authors"

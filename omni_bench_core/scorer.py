@@ -21,6 +21,7 @@ import logging
 import re
 import shutil
 import sys
+import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from statistics import fmean
@@ -48,15 +49,17 @@ class Score(NamedTuple):
     details: list[dict[str, Any]] | None = None
 
     @classmethod
-    def failed(cls, why: str) -> Score:
-        """The score of a row with no usable prediction: the system's failure, counted as 0."""
-        return cls({"status": "failed", "error": why[:300]})
+    def failed(cls, why: str, traceback: str | None = None) -> Score:
+        """The score of a row with no usable prediction: the system's failure, counted as 0. `traceback` is where
+        the scorer said so, when it did (`prediction` raising `SystemFailed`)."""
+        return cls({"status": "failed", "error": errors.capped(why),
+                    **({"traceback": errors.capped(traceback)} if traceback else {})})
 
     @classmethod
     def unscored(cls, why: str) -> Score:
         """The score of a row the scorer couldn't score, for a reason that isn't the system's. Grading isn't
         finished until a later grading scores it."""
-        return cls({"status": "unscored", "error": why[:300]})
+        return cls({"status": "unscored", "error": errors.capped(why)})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -219,8 +222,9 @@ class Scorer[R: data.Row, G, P]:
         """What the scorer reads of one prediction, which is `Adapter.read`'s output.
 
         It is separate from `score` for two reasons. First, scorers of one task read different parts of one
-        output (the html, or the layout blocks). Second, a prediction that can't be read is the system's
-        failure, not a bug: raise ValueError, and that row fails (counts as 0) while grading goes on."""
+        output (the html, or the layout blocks). Second, a prediction that can't be used is the system's
+        failure, not a bug: raise `errors.SystemFailed`, and that row fails (counts as 0, with the traceback
+        in its line) while grading goes on. Anything else it raises is a bug, and stops grading."""
         return output
 
     def score(self, pred: P, gold: G) -> Score:
@@ -375,13 +379,22 @@ class Scorer[R: data.Row, G, P]:
                 failed[r.id] = Score.failed(f"{err['type']}: {err['message']}")
                 continue
             try:
-                pred = self.prediction(run.prediction(r.id))
+                output = run.prediction(r.id)
             except FileNotFoundError:
                 failed[r.id] = Score.failed(f"no prediction: predictions/{r.id}.json")
                 continue
-            except ValueError as exc:
+            except ValueError as exc:   # Note: the core's own check that the file is JSON
                 failed[r.id] = Score.failed(str(exc))
                 continue
+            try:
+                pred = self.prediction(output)
+            except errors.SystemFailed as exc:
+                failed[r.id] = Score.failed(str(exc), "".join(traceback.format_exception(exc)))
+                continue
+            except (errors.UsageError, errors.Stop):
+                raise
+            except Exception as exc:
+                raise errors.bug(f"reading the prediction of {r.id}", exc, type(self)) from None
             ready.append((r, pred, self._gold(r)))
         return failed, ready
 
@@ -486,8 +499,10 @@ class Scorer[R: data.Row, G, P]:
         except errors.UsageError:
             raise
         except Exception as exc:
-            raise errors.UsageError(f"{self.name} can't read the gold of row {row.id}: {exc}; the dataset may hold "
-                                    f"another kind of gold than {self.name} reads, or this gold is malformed") from None
+            tb = "".join(traceback.format_exception(exc)).rstrip()
+            raise errors.UsageError(f"{self.name} can't read the gold of row {row.id}: {type(exc).__name__}: {exc}. "
+                                    f"Either the dataset holds another kind of gold than {self.name} reads, or "
+                                    f"{type(self).__name__}.gold has a bug; here is where it failed:\n{tb}") from exc
 
 
 def _unfinished(run: runs.Run, missing: Sequence[str], unscored: Sequence[tuple[str, str]], brought: bool) -> str:
@@ -498,7 +513,9 @@ def _unfinished(run: runs.Run, missing: Sequence[str], unscored: Sequence[tuple[
     out = [f"{run.folder} isn't finished, so it has no headline yet:"]
     if missing:
         out.append(f"  {errors.counted(len(missing), 'row')} "
-                   + (f"with no file in {run.predictions}" if brought else "never predicted") + f": {ids(missing)}")
+                   + (f"with no file in {run.predictions}" if brought
+                      else "never predicted, or answered but not yet read")
+                   + f": {ids(missing)}")
     if unscored:
         out.append(f"  {errors.counted(len(unscored), 'row')} not scored ({unscored[0][1][:120]}): "
                    f"{ids([i for i, _ in unscored])}")

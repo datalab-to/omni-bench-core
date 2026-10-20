@@ -47,8 +47,9 @@ class Run:
     Each row of a run is in one of three states:
 
         answered   it has a prediction
-        failed     it has a record of a failed call: the system's failure, which counts as 0
-        missing    it has neither: it was never predicted, or, in a folder of your own, it has no prediction
+        failed     it has a record of the system's failure (`SystemFailed`), which counts as 0
+        missing    it has neither: it was never predicted, or its answer is still unread (a bug in `read`
+                   stopped the run), or, in a folder of your own, it has no prediction
 
     A run is finished when none of its rows is missing. Grading refuses an unfinished run (`Scorer.grade`).
 
@@ -148,8 +149,10 @@ class Run:
         return frozenset(f.name for f in self.predictions.iterdir()) if self.predictions.is_dir() else frozenset()
 
     def attempted(self, id: str, files: frozenset[str]) -> bool:
-        """Whether the row was attempted, meaning it has a prediction (in `files`) or a record."""
-        return f"{id}.json" in files or (self.records / f"{id}.json").exists()
+        """Whether the row was attempted, meaning it has a prediction (in `files`) or a record of an answer read
+        or of a failure. An answer still unread (a bug in `read` stopped the run) isn't attempted yet."""
+        if f"{id}.json" in files: return True
+        return (rec := self.record(id)) is not None and not rec.get("unread")
 
     def needs(self, id: str, retry_failed: bool = False) -> bool:
         """Whether to call the system for this row.
@@ -166,7 +169,7 @@ class Run:
         The order matters. `needs` reads the record, so if the process is killed between the two writes, the
         row is predicted again rather than left with a record and no prediction. predictions/ holds answers
         only; a failure is written in the record alone."""
-        if rec["error"] is None:
+        if rec["error"] is None and not rec.get("unread"):
             self.write_prediction(id, rec["output"])
         else:
             (self.predictions / f"{id}.json").unlink(missing_ok=True)
@@ -182,7 +185,7 @@ class Run:
         when the record has no `output` to rebuild from (one written by an older version), which is logged."""
         if (self.predictions / f"{id}.json").exists(): return None
         rec = self.record(id)
-        if rec is None or rec.get("error") is not None: return None
+        if rec is None or rec.get("error") is not None or rec.get("unread"): return None
         if "output" not in rec:
             log.warning("%s: the record of %s has no output to rebuild its prediction from", self.folder, id)
             return None

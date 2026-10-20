@@ -75,14 +75,15 @@ class Copy(adapter.Adapter):
             CALLS.append(x.stem)
             first = CALLS.count(x.stem) == 1
         text = x.read_text()
-        if "refuse" in text: raise errors.VendorError("refused", status=400)
-        if "account" in text: raise errors.VendorError("out of credits", status=402)
-        if "flaky" in text and first: raise errors.VendorError("busy", status=503)
+        if "refuse" in text: raise errors.SystemFailed("refused", status=400)
+        if "account" in text: raise errors.SystemFailed("out of credits", status=402)
+        if "flaky" in text and first: raise errors.SystemFailed("busy", status=503)
         if "garble" in text: return adapter.Call(raw="<garbled>", cost=adapter.Cost(usd=0.5))
         return adapter.Call(raw={"answer": text.upper() if self.upper else text}, cost=adapter.Cost(usd=0.25))
 
     def read(self, raw: Any, x: Path) -> Any:
-        return {"text": raw["answer"]}
+        with adapter.reading("the answer"):
+            return {"text": raw["answer"]}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,7 +95,7 @@ class Exact(scorer.Scorer):
 
     def prediction(self, output: Any) -> str:
         if not (isinstance(output, dict) and isinstance(output.get("text"), str)):
-            raise ValueError(f"the prediction has no text: {str(output)[:80]}")
+            raise errors.SystemFailed(f"the prediction has no text: {str(output)[:80]}")
         return output["text"]
 
     def score(self, pred: str, gold: str) -> scorer.Score:
@@ -123,7 +124,7 @@ class Judge(adapter.Adapter):
         with LOCK:
             JUDGED.append(gold)
             first, _ = gold not in SEEN, SEEN.add(gold)
-        if "flaky" in gold and first: raise errors.VendorTimeout("the judge took too long")
+        if "flaky" in gold and first: raise errors.SystemTimeout("the judge took too long")
         same = pred == gold if self.strict else pred.casefold() == gold.casefold()
         return adapter.Call(raw={"verdict": "yes" if same else "no"}, cost=adapter.Cost(usd=0.01))
 
@@ -232,9 +233,9 @@ def test_failures_and_details(tmp: Path) -> None:
     folder = tmp / "runs" / name
     lines = {x["id"]: x for x in map(json.loads, (folder / "exact" / "scores.jsonl").read_text().splitlines())}
     assert lines["c1"]["status"] == "failed" and "refused" in lines["c1"]["error"]
-    assert lines["g1"]["status"] == "failed" and "ReadError" in lines["g1"]["error"]
+    assert lines["g1"]["status"] == "failed" and "Unreadable" in lines["g1"]["error"]
     rec = json.loads((folder / "records" / "g1.json").read_text())
-    assert rec["raw"] == "<garbled>" and rec["output"] is None and rec["error"]["type"] == "ReadError"
+    assert rec["raw"] == "<garbled>" and rec["output"] is None and rec["error"]["type"] == "Unreadable"
     assert lines["a1"]["exact"] is False
     assert len((folder / "exact" / "details" / "a1.jsonl").read_text().splitlines()) == 5
     assert abs(g["scorers"]["exact"]["headline"] - 2 / 4 * 4 / 6) < 1e-9    # digits survive upper()
@@ -493,12 +494,12 @@ class Billing(adapter.Adapter):
         with LOCK:
             CALLS.append(x.stem)
             first = CALLS.count(x.stem) == 1
-        if "key" in text: raise errors.VendorError("bad key", status=401)
-        if "quota" in text: raise errors.VendorError("error: insufficient_quota for this org", status=429)
+        if "key" in text: raise errors.SystemFailed("bad key", status=401)
+        if "quota" in text: raise errors.SystemFailed("error: insufficient_quota for this org", status=429)
         if "busy" in text and first:
-            raise errors.VendorError("busy", status=503, sent={"mode": "fast"}, cost=adapter.Cost(usd=0.5))
+            raise errors.SystemFailed("busy", status=503, sent={"mode": "fast"}, cost=adapter.Cost(usd=0.5))
         if "never" in text:
-            raise errors.VendorError("bad request", status=400, sent={"mode": "fast"}, cost=adapter.Cost(usd=0.1),
+            raise errors.SystemFailed("bad request", status=400, sent={"mode": "fast"}, cost=adapter.Cost(usd=0.1),
                                      job_id="job-1")
         return adapter.Call(raw={"text": text}, cost=adapter.Cost(usd=0.25), sent={"mode": "fast"})
 
@@ -544,7 +545,7 @@ def test_reading_marks_the_systems_fault(tmp: Path) -> None:
     try:
         with adapter.reading("the job's status"):
             {}["status"]
-    except errors.VendorError as exc:
+    except errors.SystemFailed as exc:
         assert "the job's status" in str(exc)
     else:
         raise AssertionError("a malformed answer was not the system's failure")
@@ -596,7 +597,7 @@ def test_a_stop_records_nothing_and_grades_nothing(tmp: Path) -> None:
         raise AssertionError("an account failure was not raised")
     [folder] = (tmp / "runs").iterdir()
     assert not (folder / "records" / "z9.json").exists() and not (folder / "exact").exists()
-    msg = refused(b.grade, folder, match="1 row never predicted: z9")
+    msg = refused(b.grade, folder, match="1 row never predicted, or answered but not yet read: z9")
     assert "run the command that made this run again" in msg and "--partial" in msg, msg
     s = b.grade(folder, partial=True)["scorers"]["exact"]
     assert s["partial"] == {"no_answer": ["z9"], "not_scored": []} and s["failed"] == 2, s
@@ -627,7 +628,7 @@ def test_an_answer_after_the_budget_is_a_timeout(tmp: Path) -> None:
     b = bench(dataset(tmp / "d", {"a1": ("letters", "hello")}))
     name = b.run(Late(), tmp / "runs", timeout=0.1)["run"]
     rec = json.loads((tmp / "runs" / name / "records" / "a1.json").read_text())
-    assert rec["error"]["type"] == "VendorTimeout" and "past the 0.1 s budget" in rec["error"]["message"], rec
+    assert rec["error"]["type"] == "SystemTimeout" and "past the 0.1 s budget" in rec["error"]["message"], rec
     assert rec["raw"] == {"answer": "hello"} and rec["cost"]["usd"] == 0.25      # paid for, so kept
 
 
@@ -682,6 +683,82 @@ def test_a_scorer_bug_names_its_row(tmp: Path) -> None:
     else:
         raise AssertionError("a bug in a scorer was not raised")
     assert not (tmp / "runs" / name / "crashes" / "summary.json").exists()
+
+
+@dataclasses.dataclass(frozen=True)
+class Polls(Copy):
+    """Reads a job id from an answer that hasn't one."""
+
+    def call(self, x: Path, *, timeout: float) -> adapter.Call:
+        with adapter.reading("the job id"):
+            job = {"status": "queued"}["job_id"]
+        return adapter.Call(raw={"answer": job})
+
+
+def test_a_failure_our_code_read_keeps_its_traceback(tmp: Path) -> None:
+    b = bench(dataset(tmp / "d", {"a1": ("letters", "hello"), "g1": ("other", "garble" * 2000)}))
+    p = b.plan(Polls(), tmp / "runs")
+    b.predict(p)
+    folder = p.run.folder
+    err = json.loads((folder / "records" / "a1.json").read_text())["error"]
+    assert err["type"] == "SystemFailed" and "couldn't be read (the job id): KeyError" in err["message"], err
+    assert "Traceback" in err["traceback"] and "in call" in err["traceback"], err
+    name = b.run(Copy(), tmp / "runs")["run"]
+    err = json.loads((tmp / "runs" / name / "records" / "g1.json").read_text())["error"]
+    assert err["type"] == "Unreadable" and "in read" in err["traceback"], err      # the reader's own line
+    assert len(err["message"]) < errors.CAP + 40
+
+
+@dataclasses.dataclass(frozen=True)
+class MisReads(Copy):
+    """Answers like Copy, but its read has a bug on one row."""
+
+    name: ClassVar[str] = "mis_reads"
+
+    def read(self, raw: Any, x: Path) -> Any:
+        if raw.get("answer") == "world": return {}["a field the code forgot"]
+        return super().read(raw, x)
+
+
+@dataclasses.dataclass(frozen=True)
+class ReadsRight(Copy):
+    name: ClassVar[str] = "mis_reads"
+
+
+@dataclasses.dataclass(frozen=True)
+class PredictionBug(Exact):
+    def prediction(self, output: Any) -> str:
+        return output["txet"]
+
+
+def test_a_bug_in_read_stops_keeps_the_answer_and_a_rerun_reads_it(tmp: Path) -> None:
+    b = bench(dataset(tmp / "d", {k: v for k, v in TEXTS.items() if k != "c1"}))
+    try:
+        b.run(MisReads(), tmp / "runs", workers=1)
+    except errors.Bug as exc:
+        assert "MisReads raised KeyError while reading the answer of a2" in str(exc) and "is saved" in str(exc), exc
+    else:
+        raise AssertionError("a bug in read was counted instead of stopping the run")
+    [folder] = (tmp / "runs").iterdir()
+    rec = json.loads((folder / "records" / "a2.json").read_text())
+    assert rec["unread"] and rec["raw"] == {"answer": "world"} and rec["error"] is None, rec
+    assert not (folder / "predictions" / "a2.json").exists()
+    refused(b.grade, folder, match="3 rows never predicted, or answered but not yet read: a2, b1, b2")
+    CALLS.clear()
+    g = b.run(ReadsRight(), tmp / "runs")                    # the fix, then the same command: no call for a2
+    assert g["run"] == folder.name and "a2" not in CALLS and g["scorers"]["exact"]["headline"] == 1.0, (CALLS, g)
+
+
+def test_a_bug_in_prediction_stops_grading_and_failures_keep_their_traceback(tmp: Path) -> None:
+    name = bench(dataset(tmp / "d")).run(Copy(), tmp / "runs")["run"]
+    rec = json.loads((tmp / "runs" / name / "records" / "c1.json").read_text())
+    assert rec["error"]["type"] == "SystemFailed" and "in call" in rec["error"]["traceback"], rec["error"]
+    try:
+        bench(tmp / "d", PredictionBug()).grade(tmp / "runs" / name)
+    except errors.Bug as exc:
+        assert "PredictionBug raised KeyError while reading the prediction of a1" in str(exc), exc
+    else:
+        raise AssertionError("a bug in prediction() was counted instead of stopping grading")
 
 
 def test_a_missing_key_is_refused_before_any_call(tmp: Path) -> None:

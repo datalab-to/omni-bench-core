@@ -169,6 +169,7 @@ class Benchmark:
         also how several runs share one rate limit: give each run a factory that returns one shared pool."""
         r = p.run
         r.prepare(p.question, data.commit(self.dataset, data.download_dataset(self.dataset)), p.timeout)
+        self._read_unread(r, p.rows)
         work = collections.deque(x for x in p.rows if r.needs(x.id, p.retry_failed))
         live: dict[cf.Future, data.Row] = {}
         failure: BaseException | None = None
@@ -242,10 +243,25 @@ class Benchmark:
         changed = []
         for x in self.rows():
             if (rec := run.record(x.id)) is None: continue
-            if (new := adapter.reread(run.system, self.task.input(x), rec)) != rec:
+            try:
+                new = adapter.reread(run.system, self.task.input(x), rec)
+            except errors.Unread as exc:
+                raise errors.bug(f"reading the answer of {x.id}", exc.__cause__ or exc, type(run.system)) from None
+            if new != rec:
                 run.save(x.id, new)
                 changed.append(x.id)
         return changed
+
+    def _read_unread(self, r: runs.Run, rows: Sequence[data.Row]) -> None:
+        """Reads again, with no call, every answer of `r` that a bug in `read` left unread, so running the same
+        command again after the fix picks up where it stopped. A `read` that still raises stops here, before any
+        call."""
+        for x in rows:
+            if not (rec := r.record(x.id)) or not rec.get("unread"): continue
+            try:
+                r.save(x.id, adapter.reread(r.system, self.task.input(x), rec))
+            except errors.Unread as exc:
+                raise errors.bug(f"reading the answer of {x.id}", exc.__cause__ or exc, type(r.system)) from None
 
     def _inputs(self, rows: Sequence[data.Row]) -> None:
         """Refuses rows whose input file is missing (`Task.input` raises), listing them all."""
@@ -281,6 +297,10 @@ def _saved(r: runs.Run, x: data.Row, f: cf.Future, board: progress.Board) -> Bas
     stop the run with: a bug in the adapter is raised as `errors.Bug`, which names whose code it is."""
     try:
         rec = f.result()
+    except errors.Unread as exc:
+        r.save(x.id, exc.record)
+        return errors.bug(f"reading the answer of {x.id} (the answer is saved, and is read again when you run the "
+                          "same command after the fix)", exc.__cause__ or exc, type(r.system))
     except BaseException as exc:
         if isinstance(exc, Exception) and not isinstance(exc, errors.Stop):
             return errors.bug(f"predicting {x.id}", exc, type(r.system))

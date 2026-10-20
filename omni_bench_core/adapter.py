@@ -143,7 +143,7 @@ class Adapter[I]:
         """Asks the system about one input, and returns its answer as received.
 
         This is the one method every adapter writes, because how to reach a system is what differs between
-        systems. On a failure, raise it (`errors.VendorError` or one of its kinds) rather than returning an
+        systems. On a failure, raise `errors.SystemFailed` (or one of its kinds) rather than returning an
         empty answer. That way the row is recorded as failed, not as a system that answered nothing.
         `timeout` is the seconds left in the row's budget. A call that polls spends it with a `Budget`."""
         raise NotImplementedError(f"{type(self).__name__} has no call(x, *, timeout) -> Call")
@@ -151,8 +151,10 @@ class Adapter[I]:
     def read(self, raw: Any, x: I) -> Any:
         """The output in a raw answer. It is what predictions/<id>.json holds, and what every scorer reads.
 
-        It is separate from `call` because a bug in reading is cheap to fix and a call is not: after a fix,
-        `Benchmark.reread` reads every saved answer again, with no call. Raise when `raw` holds no output."""
+        It is separate from `call` because a bug in reading is cheap to fix and a call is not: the raw answer is
+        saved first. Raise `errors.SystemFailed` when the answer is unusable (an LLM's broken JSON): that row
+        counts 0. Anything else `read` raises is a bug: the run stops, the answer is kept, and running the same
+        command again after the fix reads it again with no call."""
         return raw
 
     @property
@@ -161,7 +163,7 @@ class Adapter[I]:
         (one class for every model behind one API). Then the model should name the folder."""
         return self.name
 
-    def account_failure(self, e: errors.VendorError) -> bool:
+    def account_failure(self, e: errors.SystemFailed) -> bool:
         """Whether failure `e` is the account's: a key the system refuses (401), an account that can't pay
         (402), or a known phrase saying so. Such a failure is the same for every row, so the run stops.
 
@@ -201,9 +203,9 @@ class Budget:
         return time.monotonic() >= self._deadline
 
     def check(self, what: str) -> None:
-        """Raises `VendorTimeout` if the time is up. `what` says what was still being waited for."""
+        """Raises `SystemTimeout` if the time is up. `what` says what was still being waited for."""
         if self.expired():
-            raise errors.VendorTimeout(f"timed out at the {self.total:.0f}s limit; {what}")
+            raise errors.SystemTimeout(f"timed out at the {self.total:.0f}s limit; {what}")
 
 
 class PollRetry:
@@ -233,21 +235,21 @@ class PollRetry:
 
 @contextlib.contextmanager
 def reading(what: str) -> Iterator[None]:
-    """Marks code that reads a system's answer. A `ValueError`, `KeyError`, `IndexError`, `TypeError` or
-    `AttributeError` raised inside (a JSON array where an object was expected) is the system's fault, not a bug: it becomes a `VendorError` saying what couldn't be read, so the
-    row fails and the run goes on.
+    """Says that a malformed answer read inside this block is the system's failure: a `ValueError`, `KeyError`,
+    `IndexError`, `TypeError` or `AttributeError` raised inside (a JSON array where an object was expected)
+    becomes a `SystemFailed` saying what couldn't be read, so the row counts 0 and the run goes on. The record
+    keeps the original exception's traceback, which shows whether the answer changed or the reading is wrong.
 
         with adapter.reading("the job's status"):
             status = resp.json()["status"]
 
-    It exists so the line between a system's failure and our bug is exact. Inside `reading`, a malformed answer
-    fails one row; anywhere else in `call`, an exception is a bug in the adapter, and stops the run. Reading
-    the output itself belongs in `read`, where any failure is already the row's (`errors.ReadError`)."""
+    It is shorthand for raising `SystemFailed` yourself. Outside it, an exception in `call` or `read` is a bug,
+    and stops the run."""
     try:
         yield
     except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
-        raise errors.VendorError(f"the system's answer couldn't be read ({what}): {type(exc).__name__}: {exc}"[:400]
-                                 ) from None
+        raise errors.SystemFailed(f"the system's answer couldn't be read ({what}): {type(exc).__name__}: "
+                                  f"{exc}") from exc
 
 
 def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
@@ -289,19 +291,20 @@ def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
 def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """Sends one input to `a`, and returns the row's record: its answer and the evidence for it.
 
-    Failures are handled in three ways:
+    What it does with an exception follows the one rule (`errors`):
 
-    - a transient failure (a 429, a 5xx) is retried, up to `a.retries` times, within the row's budget. An
-      answer that arrives after the budget is a timeout, so every system gets the same time;
-    - any other failure is the row's answer. It is recorded as `error`, not raised, because it is a fact
-      about this row; and
-    - a `Stop`, or an account failure, is raised. It is the same for every row, and if it were recorded it
-      would look like a settled answer that no resumed run tries again.
+    - `SystemFailed` is the row's answer: recorded as `error`, with its traceback, and counted 0. A transient
+      one (a 429, a 5xx) is retried first, up to `a.retries` times, within the row's budget. An answer that
+      arrives after the budget is a timeout, so every system gets the same time;
+    - a 401, a 402 or an account phrase (`Adapter.account_failure`) is raised as `AccountFailure`, and a
+      refused connection as a `Stop`: they would be the same for every row; and
+    - anything else is raised: a bug. When `read` raised it, it comes as `errors.Unread`, carrying the record,
+      so the paid answer is saved before the run stops.
 
     The record holds `system`, `options`, `package` (the adapter's package and version, so answers from two
     versions of an adapter can be told apart), `output` (None on a failure), `raw`, `sent`, `error` (its type,
-    status, whether it was transient, and its message), `cost` (with `wall_s` and `attempts`), `job_id`,
-    `timeout_s` and `captured_at`.
+    status, whether it was transient, its message and its traceback), `cost` (with `wall_s` and `attempts`),
+    `job_id`, `timeout_s` and `captured_at`; and `unread` when `read` raised a bug.
     """
     budget = Budget(timeout)
     started = time.time()
@@ -319,31 +322,31 @@ def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict
             raise
         except Exception as exc:
             if errors.refused(exc):
-                raise errors.Stop(f"{a.label} couldn't connect: the connection was refused ({str(exc)[:200]}). If it "
-                                  "calls a server you run, start it (or pass its base_url), then run the same command "
-                                  "again") from None
-            if not isinstance(exc, errors.VendorError): raise
+                raise errors.Stop(f"{a.label} couldn't connect: the connection was refused ({exc}). If it calls a "
+                                  "server you run, start it (or pass its base_url), then run the same command "
+                                  "again") from exc
+            if not isinstance(exc, errors.SystemFailed): raise
             if a.account_failure(exc):
-                raise errors.AccountFailure(f"{a.label}: {str(exc)[:200]}; fix the account (its key, its credits), "
-                                            "then run the same command again") from None
+                raise errors.AccountFailure(f"{a.label}: {exc}; fix the account (its key, its credits), then run the "
+                                            "same command again") from exc
             if isinstance(exc.cost, Cost): spent.append(exc.cost)
             error = exc
             if not exc.transient or attempt == a.retries: break
             time.sleep(min(a.backoff[min(attempt, len(a.backoff) - 1)] if a.backoff else 0.0, budget.remaining()))
             if budget.expired():
-                error = errors.VendorTimeout(f"the {timeout:g} s budget was spent over {attempts} attempts; "
-                                             f"last failure: {exc}"[:400])
+                error = errors.SystemTimeout(f"the {timeout:g} s budget was spent over {attempts} attempts; "
+                                             f"last failure: {exc}")
                 break
     # Note: an adapter is asked to keep to its budget, but nothing makes it; an answer that came after the budget
     # is a timeout like any other, so every system gets the same time. The answer is kept: it was paid for.
     if error is None and (wall := time.time() - started) > timeout:
-        error = errors.VendorTimeout(f"answered after {wall:.1f} s, past the {timeout:g} s budget")
+        error = errors.SystemTimeout(f"answered after {wall:.1f} s, past the {timeout:g} s budget")
     rec = record(a, got, error, attempts=attempts, timeout=timeout, wall_s=round(time.time() - started, 1),
                  at=time.strftime("%Y-%m-%dT%H:%M:%S"), spent=spent)
     return rec if error is not None else reread(a, x, rec)
 
 
-def record(a: Adapter, got: Call | None, error: errors.VendorError | None, *, attempts: int, timeout: float,
+def record(a: Adapter, got: Call | None, error: errors.SystemFailed | None, *, attempts: int, timeout: float,
            wall_s: float, at: str, spent: Sequence[Cost] = ()) -> dict[str, Any]:
     """A row's record, built from what the calls returned: either the answer as received, or the failure.
 
@@ -364,23 +367,34 @@ def record(a: Adapter, got: Call | None, error: errors.VendorError | None, *, at
 
 
 def reread[I](a: Adapter[I], x: I, rec: dict[str, Any]) -> dict[str, Any]:
-    """`rec` with its output read again from its raw answer by `a.read`.
+    """`rec` with its output read again from its raw answer by `a.read`. A record whose call failed is returned
+    unchanged, because it has no answer to read.
 
-    The result is either an answer, or a `ReadError` that keeps the raw answer for a later fix. A record
-    whose call failed is returned unchanged, because it has no answer to read."""
-    if rec["error"] is not None and rec["error"]["type"] != "ReadError":
+    `read` raising `SystemFailed` records the answer as `Unreadable`, which counts 0 and keeps the raw answer.
+    Anything else it raises is a bug in `read`: it is raised as `errors.Unread`, carrying the record with the
+    raw answer and no output, so the answer is saved before the run stops."""
+    if rec["error"] is not None and rec["error"]["type"] != "Unreadable":
         return rec
+    rec = {k: v for k, v in rec.items() if k != "unread"}
     try:
         return rec | {"output": a.read(rec["raw"], x), "error": None}
+    except errors.SystemFailed as exc:
+        e = errors.Unreadable(f"{type(exc).__name__}: {exc}" if type(exc) is not errors.SystemFailed else str(exc))
+        e.__cause__ = exc
+        return rec | {"output": None, "error": _failure(e)}
     except errors.Stop:
         raise
-    except Exception as exc:  # noqa: BLE001 -- any reader failure is this row's, and its raw answer is kept
-        return rec | {"output": None, "error": _failure(errors.ReadError(f"{type(exc).__name__}: {exc}"[:400]))}
+    except Exception as exc:
+        raise errors.Unread(rec | {"output": None, "error": None, "unread": True}) from exc
 
 
-def _failure(e: errors.VendorError) -> dict[str, Any]:
-    """A failure, as a record states it."""
-    return {"type": type(e).__name__, "status": e.status, "transient": e.transient, "message": str(e)[:600]}
+def _failure(e: errors.SystemFailed) -> dict[str, Any]:
+    """A failure, as a record states it, with the traceback of where it was raised (and of what it was raised
+    from), so it is always clear which line decided the system failed."""
+    import traceback
+
+    return {"type": type(e).__name__, "status": e.status, "transient": e.transient, "message": errors.capped(str(e)),
+            "traceback": errors.capped("".join(traceback.format_exception(e)))}
 
 
 def retryable(error: Mapping[str, Any] | None) -> bool:
@@ -389,5 +403,5 @@ def retryable(error: Mapping[str, Any] | None) -> bool:
     A timeout, an outage or a transient status might. A failure that is an answer (a 400, a refusal, an
     answer that couldn't be read) won't."""
     if not error: return False
-    return (error.get("type") in ("VendorTimeout", "VendorUnreachable")
+    return (error.get("type") in ("SystemTimeout", "SystemUnreachable")
             or error.get("status") in errors.TRANSIENT_STATUSES)

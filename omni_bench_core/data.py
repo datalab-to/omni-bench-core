@@ -119,7 +119,7 @@ def download_dataset(dataset: str | Path) -> Path:
             except Exception as exc:
                 if attempt == DOWNLOAD_ATTEMPTS - 1: raise
                 log.warning("downloading %s failed (%s: %s); trying again in %ds", dataset, type(exc).__name__,
-                            str(exc)[:200], 30 * (attempt + 1))
+                            exc, 30 * (attempt + 1))
             time.sleep(30 * (attempt + 1))
     finally:
         if cached: huggingface_hub.utils.enable_progress_bars()

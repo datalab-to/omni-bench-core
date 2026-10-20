@@ -127,7 +127,7 @@ such as a mode or a model. One instance is one configuration of the system: `Dat
 It has two methods:
 
 - `call(input)`: calls the system and returns a `Call`, which holds the answer exactly as received (`raw`)
-  and what the system said it cost (`cost`). On a failure it raises a `VendorError`; and
+  and what the system said it cost (`cost`). On a failure it raises a `SystemFailed`; and
 - `read(raw, input)`: turns the raw answer into the output the scorers read. The default returns `raw`
   unchanged.
 
@@ -155,22 +155,26 @@ You don't write retries, timeouts or error handling. The core wraps every call i
     call ----> answer ----> read ----> output                       the row's record
       |
       +-- 429 or 5xx (transient)  -> wait, call again, up to `retries` times
-      +-- 400, a refusal, ...     -> recorded as the row's error; the run goes on
+      +-- SystemFailed (a 400 ...) -> recorded as the row's error, with its traceback; the run goes on
       +-- past the timeout        -> recorded as a timeout, even if an answer came later
       +-- 401, 402 (the account)  -> the whole run stops, since every row would fail
       +-- connection refused      -> the whole run stops: nothing listens at the address
       +-- any other exception     -> a bug: the run stops and prints its traceback
 ```
 
-What your `call` raises decides which of these happens:
+What your `call` and `read` raise decides which of these happens. One rule covers them: a row counts 0 only
+when you say the system failed.
 
-- `errors.VendorError(message, status=...)`, or one of its kinds (`VendorTimeout`, `VendorUnreachable`): the
-  system failed on this row. It is recorded and counts 0, and a transient status is retried first;
+- `errors.SystemFailed(message, status=...)`, or one of its kinds (`SystemTimeout`, `SystemUnreachable`): the
+  system failed on this row. It is recorded with its traceback and counts 0, and a transient status is
+  retried first. Raise it in `read` for an answer you can't use (an LLM's broken JSON), or wrap the reading
+  in `with adapter.reading("..."):`, which raises it for you;
 - `errors.Stop(message)`, or one of its kinds (`MissingCredential`, `AccountFailure`): the run can't go on
   for any row. Say what to fix in the message. Declaring `keys` makes the core raise `MissingCredential`
   before any call, so you rarely raise it yourself; and
 - anything else: a bug in your adapter. The run stops, and prints the whole traceback, whose code it is, and
-  the versions a bug report needs.
+  the versions a bug report needs. If `read` raised it, the answer is kept, and is read again with no call
+  when you run the same command after the fix.
 
 ### Run
 
@@ -359,20 +363,20 @@ scorer can't break them.
 2. Grading reports only a finished run: every row it asked about has an answer or a recorded failure, and a
    score. Otherwise grading refuses, names the rows, and says how to finish them. `partial=True` (`--partial`
    on a command line) grades anyway and counts those rows as failed; the summary then says so, with their ids.
-3. A failure that is the system's counts 0. A failure that is ours stops the run with nothing recorded, so
-   running the same command again does the row.
+3. A row counts 0 only when code says, on purpose, that the system failed, by raising `errors.SystemFailed`.
+   Any other exception stops the run and prints its traceback. A stop keeps every answer that was paid for,
+   so running the same command again after the fix costs nothing for the rows already done.
 
 What that means, case by case:
 
 | what happens | what you see | the row counts | what to do |
 | --- | --- | --- | --- |
 | the system answers | the run goes on | its score | nothing |
-| the system refuses, errors or answers something unreadable | the row is recorded as failed, and the run goes on | 0 | nothing; its error is in `scores.jsonl` and `records/<id>.json` |
+| the system refuses, errors or answers something unusable (the adapter raises `SystemFailed`, or `reading()` does) | the row is recorded as failed, with the traceback of where it was raised, and the run goes on | 0 | nothing; its error is in `scores.jsonl` and `records/<id>.json` |
 | the system times out, or keeps answering 429 or 5xx | the row is recorded as failed, and the run goes on; an answer that comes after the timeout counts as a timeout | 0 | optionally run again with `retry_failed=True` (`--retry-failed`) |
 | your key is missing or wrong, or your account is out of credits | the run stops and says why; a missing key stops it before any call | not yet | fix it, then run the same command again |
 | a model server you host isn't running | the run stops and says so | not yet | start it, then run the same command again |
-| an adapter's code crashes while calling the system | the run stops, prints the whole traceback, and says whose code it is and where to report it | not yet | report it; run the same command again after a fix |
-| an adapter's code can't read an answer (an error in `read`) | the row is recorded as an unreadable answer (`ReadError`), keeping the raw answer, and the run goes on | 0 | if it's the adapter's bug: fix `read`, then `reread` the run, which reads the saved answers again with no call |
+| an adapter's or a scorer's code raises anything else (a bug) | the run stops, prints the whole traceback, and says whose code it is and where to report it; an answer `read` crashed on is kept, unread | not yet | report it; run the same command again after a fix, which reads kept answers again with no call |
 | you stop the run (Ctrl-C, a closed laptop) | nothing is lost | not yet | run the same command again |
 | a judge doesn't answer for a row | grading says that row isn't scored | not yet | grade again (kept scores aren't paid for again) |
 | you grade while rows are "not yet" | grading refuses and names the rows | — | finish them, or grade with `partial=True` to count them 0 |
