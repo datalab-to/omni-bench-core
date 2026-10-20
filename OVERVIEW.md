@@ -42,10 +42,10 @@ There are five pieces. Three of them you write, and two are given.
 ```
   Benchmark(task, dataset, scorers)
      |
-     |  .run([adapter, adapter, ...], out)
+     |  .run(adapter, out)                  one system per run
      v
   +--------------------------------------------------------------+
-  |  for each adapter: a Run (a folder under `out`)              |
+  |  a Run: a folder under `out`                                 |
   |                                                              |
   |    for each row:  Task.input(row) -> Adapter -> answer       |
   |                   saved in the Run                           |
@@ -54,7 +54,7 @@ There are five pieces. Three of them you write, and two are given.
   +--------------------------------------------------------------+
 ```
 
-Each piece below has a small example from `tests/test_core.py`. That file holds a whole toy task: the
+Each piece below has a small example from [`tests/test_core.py`](https://github.com/datalab-to/omni-bench-core/blob/main/tests/test_core.py). That file holds a whole toy task: the
 "system" is asked to copy a text file's text, and it is graded on whether the copy is exact.
 
 ### The dataset and its rows
@@ -92,8 +92,8 @@ class Doc:
         return self.doc_id
 ```
 
-A dataset can have more than one manifest. `manifests/sample40.parquet` is a subset of 40 rows, used to
-compare systems cheaply (see "A quick look, and a fair comparison" below).
+A dataset can have more than one manifest, such as `manifests/sample40.parquet`, a subset of 40 rows that a
+dataset's authors chose.
 
 ### Task
 
@@ -156,32 +156,50 @@ You don't write retries, timeouts or error handling. The core wraps every call i
       |
       +-- 429 or 5xx (transient)  -> wait, call again, up to `retries` times
       +-- 400, a refusal, ...     -> recorded as the row's error; the run goes on
+      +-- past the timeout        -> recorded as a timeout, even if an answer came later
       +-- 401, 402 (the account)  -> the whole run stops, since every row would fail
+      +-- connection refused      -> the whole run stops: nothing listens at the address
+      +-- any other exception     -> a bug: the run stops and its traceback is saved
 ```
+
+What your `call` raises decides which of these happens:
+
+- `errors.VendorError(message, status=...)`, or one of its kinds (`VendorTimeout`, `VendorUnreachable`): the
+  system failed on this row. It is recorded and counts 0, and a transient status is retried first;
+- `errors.Stop(message)`, or one of its kinds (`MissingCredential`, `AccountFailure`): the run can't go on
+  for any row. Say what to fix in the message. Declaring `keys` makes the core raise `MissingCredential`
+  before any call, so you rarely raise it yourself; and
+- anything else: a bug in your adapter. The run stops, and the traceback is saved to `bugs/<id>.txt`. Those
+  files stay after a fix, as a record of what happened; delete them whenever you like.
 
 ### Run
 
-A run is one adapter's folder of answers. You never write one, but you will read its files, so it helps to
-know what is in it.
+A run is one system's answers to one exact question, kept in a folder. You never write one, but you will
+read its files, so it helps to know what is in it.
+
+The question is everything that changes the answers: the system and its options, the dataset, the manifest,
+the task, and which rows (`suites`, `sample`, `limit`, `only`). The folder's name is a digest of all of it:
 
 ```
-  runs/copy-1a2b3c4d/                 <adapter name>-<digest of its options>
-    settings.json                     the adapter's options, the dataset, the manifest and the task
+  runs/copy-1a2b3c4d/                 <system name>-<digest of the question>
+    settings.json                     the question: provider (the system), settings (its options), dataset,
+                                      manifest, task and rows; and the timeout
     records/a1.json                   everything about one row's call: output, raw answer, error, cost
     predictions/a1.json               just the output; this is what grading reads
+    bugs/a1.txt                       a traceback, only if the adapter's code crashed on that row
     exact/                            one folder per scorer
       scores.jsonl                    one line per row
       summary.json                    the summary, with its headline
       details/a1.jsonl                each row's breakdown, if the scorer gives one
 ```
 
-The folder's name holds a digest of the adapter's options, so two configurations never share a folder. A
-run folder belongs to one dataset, one manifest and one task: pointing it at another is refused, so answers
-for one dataset are never graded against another's gold.
-
-A run can be stopped and started again. Before calling the system for a row, the run checks whether that
-row already has a record. If it does, the row is skipped. So rerunning the same command only calls the
-system for the rows it hasn't answered yet, and no answer is paid for twice.
+So asking another question uses another folder, and nothing gets mixed: `sample=20` and the full dataset
+are two runs, as are two configurations of one system. The rows are named by how they were chosen, so
+`sample=6` and `limit=6` are two runs even on a dataset where both pick the same rows. The timeout isn't
+part of the question: running again with a longer one (and `retry_failed`) gives the timed-out rows more time
+in the same folder, and each record keeps the timeout it had. Asking the same question again uses the same folder
+and resumes it: before calling the system for a row, the run checks whether that row already has a record,
+and skips it if so. No answer is paid for twice.
 
 ### Scorer
 
@@ -221,12 +239,14 @@ Grading turns each row into one line of `scores.jsonl`, and all the lines into o
                                                              |
                                                          summarize
                                                              v
-           {"headline": 0.333, "exact": 0.5, "coverage": 0.667, "failed": 1, "per_suite": {...}}
+           {"headline": 0.333, "headline_is": "exact × coverage", "exact": 0.5, "coverage": 0.667,
+            "rows": 3, "failed": 1, "per_suite": {...}}
 ```
 
 By default the summary is the mean of each number over the scored rows, overall and per suite. The headline
-is the mean of the first number, or of `headline_field` when you set it. A scorer whose rows combine in
-another way, such as one rate over every row's counts, writes its own `summarize`.
+is that number for the first field, or for `headline_field` when you set it, times coverage: the share of
+rows that didn't fail, so a failed row counts as 0. `headline_is` says so in the file. A scorer whose rows
+combine in another way, such as one rate over every row's counts, writes its own `summarize`.
 
 `Scorer.grade` runs those steps and applies the rules (below). You can't override it, so every scorer
 follows the same rules.
@@ -297,71 +317,70 @@ only decides how to compute the scores.
 
 ### Benchmark
 
-A benchmark is a task, a dataset and its scorers: everything that stays fixed while the systems change.
+A benchmark is a task, a dataset and its scorers: everything that stays fixed while the systems change. A
+run is one system on it; to compare systems, run each, with the same choice of rows.
 
 ```python
 b = benchmark.Benchmark(Copying(), "my-dataset", [Exact()])
-b.run([Copy(), Copy(upper=True)], out="runs")
+b.run(Copy(), out="runs")
+b.run(Copy(upper=True), out="runs")          # another configuration is another run, in its own folder
 ```
 
 `run` does three steps in order. Each step reads what the one before it wrote to disk, so you can also call
 them one at a time:
 
 ```
-  b.run(systems, out)
+  b.run(system, out)
     |
-    +-- plan(systems, out)    checks everything before any call: the options, the run folders, and that
-    |                         every gold can be read. Returns a Plan: the runs, and the rows to predict.
+    +-- plan(system, out)     checks everything before any call: the options, the API keys, the rows, their
+    |                         input files and golds. Returns a Plan: the run, and the rows to predict.
     |
-    +-- predict(plan)         for each run, calls the system on each row with no record, `workers` at a
-    |                         time, and saves each record as it arrives.
+    +-- predict(plan)         calls the system on each row with no record, `workers` at a
+    |                         time, and saves each record as it arrives. A table shows the progress.
     |
-    +-- grade(run)            each scorer grades the run over the whole manifest; returns the summaries
-                              and the run's cost.
+    +-- grade(run)            each scorer grades the run over its rows; returns the summaries and the
+                              run's cost. It refuses a run that isn't finished.
 ```
 
 Other things a benchmark does:
 
-- `b.grade("mine/")`: grades a folder of predictions you made yourself, `mine/predictions/<id>.json`;
+- `b.grade("mine/")`: grades a folder of predictions you made yourself, `mine/predictions/<id>.json`, over
+  the whole manifest;
 - `b.reread(run)`: reads every saved raw answer again with the adapter's `read`, after you fix it;
 - `b.check()`: checks the dataset (manifest, input files, gold) without calling anything; and
 - `b.describe(plan)`: says in words what a plan will do, before you pay for it.
 
 ## The rules
 
-These are the rules every run follows. They live in the parts you don't write, so a new adapter or scorer
-can't break them.
+Three rules decide what happens in every case. They live in the parts you don't write, so a new adapter or
+scorer can't break them.
 
-- A row whose call failed, or whose answer couldn't be read, is failed. It counts as 0 in the headline:
-  the headline is the scorer's number times coverage (the share of rows that didn't fail). To find out why a
-  row failed, look at its `failed` line in `scores.jsonl`, which holds the error, and at `records/<id>.json`.
-- A row the system was never asked about is pending. While any row is pending, the headline is null, because
-  a number over part of the rows can't be compared with a number over all of them.
-- A row the scorer couldn't score, for a reason that isn't the system's fault (a judge that didn't answer),
-  is unscored. It too makes the headline null, until a later grading scores it.
-- A run folder holds one configuration of one system, on one dataset, one manifest and one task.
-- An answer is never paid for twice: a stopped run resumes where it stopped.
+1. A run folder answers one exact question: the system and its options, the dataset, the manifest, the task
+   and which rows. Another question gets another folder; the same question resumes the same one.
+2. Grading reports only a finished run: every row it asked about has an answer or a recorded failure, and a
+   score. Otherwise grading refuses, names the rows, and says how to finish them. `partial=True` (`--partial`
+   on a command line) grades anyway and counts those rows as failed; the summary then says so, with their ids.
+3. A failure that is the system's counts 0. A failure that is ours stops the run with nothing recorded, so
+   running the same command again does the row.
 
-```
-  each row of the manifest is one of:
+What that means, case by case:
 
-    scored     the scorer's numbers                  counts in the headline
-    failed     the call failed, or the answer was    counts as 0 in the headline
-               unreadable
-    unscored   the scorer couldn't score it          headline is null until it is scored
-    pending    never asked                           headline is null until it is asked
-```
+| what happens | what you see | the row counts | what to do |
+| --- | --- | --- | --- |
+| the system answers | the run goes on | its score | nothing |
+| the system refuses, errors or answers something unreadable | the row is recorded as failed, and the run goes on | 0 | nothing; its error is in `scores.jsonl` and `records/<id>.json` |
+| the system times out, or keeps answering 429 or 5xx | the row is recorded as failed, and the run goes on; an answer that comes after the timeout counts as a timeout | 0 | optionally run again with `retry_failed=True` (`--retry-failed`) |
+| your key is missing or wrong, or your account is out of credits | the run stops and says why; a missing key stops it before any call | not yet | fix it, then run the same command again |
+| a model server you host isn't running | the run stops and says so | not yet | start it, then run the same command again |
+| an adapter's code crashes while calling the system | the run stops, prints the traceback, saves it to `bugs/<id>.txt`, and says where to report it | not yet | report it; run the same command again after a fix |
+| an adapter's code can't read an answer (an error in `read`) | the row is recorded as an unreadable answer (`ReadError`), keeping the raw answer, and the run goes on | 0 | if it's the adapter's bug: fix `read`, then `reread` the run, which reads the saved answers again with no call |
+| you stop the run (Ctrl-C, a closed laptop) | nothing is lost | not yet | run the same command again |
+| a judge doesn't answer for a row | grading says that row isn't scored | not yet | grade again (kept scores aren't paid for again) |
+| you grade while rows are "not yet" | grading refuses and names the rows | — | finish them, or grade with `partial=True` to count them 0 |
+| you change the system, options, dataset, manifest or rows | a new run folder is used | — | nothing; the old folder is untouched |
+| you grade a folder of your own and a prediction is missing | grading refuses and names the rows | — | add them, or grade with `partial=True` to count them 0 |
 
-## A quick look, and a fair comparison
-
-There are two ways to run on fewer rows, for two different purposes:
-
-- to look: `run(..., sample=20)` (or `limit`, or `only`) calls the system on a few rows. The grading shows the
-  numbers over those rows, and no headline, because the other rows are pending. Running again without
-  `sample` predicts only the rest; and
-- to compare: make the subset a manifest of the dataset, such as `manifests/sample40.parquet`, and run on that
-  manifest. Every row of the manifest is predicted, so the run has a headline, and its settings.json names
-  the manifest, so it can't be mistaken for a run on the whole dataset.
+Two systems run with the same `sample` answer the same rows, so their headlines can be compared.
 
 ## When you need more
 
@@ -371,12 +390,14 @@ Each of these is optional, has a default, and is described in its class's docstr
 | --- | --- |
 | a summary broken down by something the row holds (a language, a source) | return it from `Scorer.row_fields`, and group by it in `summarize` with `scorer.per(lines, "row.<field>", over)` |
 | a slow scorer, an LLM as a judge, or scoring on your own machines | see "How scoring runs" above |
-| to call a system with more or fewer rows at once | `workers=` on `run`, one number or one per adapter name |
+| to call a system with more or fewer rows at once | `workers=` on `run`; 0 means the adapter's own `workers` |
+| to run several systems at once, sharing one rate limit | run each in its own thread or process; to share a limit, give each run an `executor` factory that returns one shared pool |
 | to run each row somewhere else (processes, a cluster) | `executor=` on `run`, a function that makes a `concurrent.futures.Executor` |
-| to try a scorer without writing results | `scorer.grade(run, rows, write=False)` |
+| to try a scorer without writing results | `b.grade(run, write=False)` |
+| a number for a run you can't finish | `b.grade(run, partial=True)`: unfinished rows count 0, and the summary lists them |
 
 ## Where to go next
 
-- `tests/test_core.py`: the whole toy task above, with tests of every rule. Run it with
-  `PYTHONPATH=. python tests/test_core.py`; and
+- [`tests/test_core.py`](https://github.com/datalab-to/omni-bench-core/blob/main/tests/test_core.py): the whole toy task above, with tests of every rule. From a clone of the
+  repository, run it with `PYTHONPATH=. python tests/test_core.py`; and
 - the class docstrings in `omni_bench_core/`: what each method is for, and when you would write it.

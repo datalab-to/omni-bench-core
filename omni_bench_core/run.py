@@ -1,17 +1,22 @@
 """Runs: one system's answers to a dataset, kept in a folder.
 
 `Run` is the folder and the bookkeeping over it. Its docstring says what the folder holds and the rules it
-follows. `total` adds up costs. `write_json`, `write_text` and `write_lines` write a file whole, so a crash
-never leaves half a file.
+follows. `folder_name` names a run's folder after the question it answers. `total` adds up costs.
+`write_bug` saves a bug's traceback. `write_json`, `write_text` and `write_lines` write a file whole, so a
+crash never leaves half a file.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import hashlib
 import json
 import logging
 import os
-from collections.abc import Iterable, Iterator, Sequence
+import platform
+import re
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -22,14 +27,17 @@ log = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class Run:
-    """One system's answers to a dataset, kept in a folder, and the system that predicts into it.
+    """One system's answers to one question, kept in a folder, and the system that predicts into it.
 
-    The folder holds:
+    A run answers one exact question: one system with its options, on one dataset, manifest and task, for
+    one choice of rows (`data.selection`). The folder is named after all of it (`folder_name`), so asking
+    another question uses another folder, and asking the same one again resumes this one. The folder holds:
 
         <folder>/
-          settings.json           what the run asked (system, options, timeout), and its dataset and manifest
+          settings.json           the question (system, options, dataset, manifest, task, rows) and the timeout
           records/<id>.json       everything `adapter.predict` returned for each row: the source of truth
           predictions/<id>.json   each row's output alone, which is all that grading reads
+          bugs/<id>.txt           the traceback of a bug in the adapter, if it had one on that row
           <scorer>/               each scorer's scores.jsonl, summary.json and details/
 
     Answers cost money and time, so each one is written to a file as it arrives. A run that stops resumes
@@ -37,18 +45,18 @@ class Run:
 
     A `Run` is an address, like a `Path`. What it holds is whatever its folder holds when it is read. A
     folder of your own predictions is a run with no system (`Run.at`). Its settings.json names no system,
-    which is how the two kinds are told apart (`brought`).
+    which is how the two kinds are told apart (`brought`). It is graded over the whole manifest.
 
     Each row of a run is in one of three states:
 
         answered   it has a prediction
-        failed     it has a record of a failed call; or it is in a folder of your own and has no
-                   prediction, meaning your system didn't answer it
-        pending    it is in a run made by predicting, and has neither a record nor a prediction: it was
-                   never attempted
+        failed     it has a record of a failed call: the system's failure, which counts as 0
+        missing    it has neither: it was never predicted, or, in a folder of your own, it has no prediction
+
+    A run is finished when none of its rows is missing. Grading refuses an unfinished run (`Scorer.grade`).
 
     Its methods are the bookkeeping that any loop over rows needs: what was recorded, what still needs a
-    call, and what is pending. They live here, once, so every task follows the same rules."""
+    call, and what is missing. They live here, once, so every task follows the same rules."""
 
     folder: Path
     system: adapter.Adapter | None = None
@@ -92,44 +100,36 @@ class Run:
         return said
 
     def brought(self) -> bool:
-        """Whether the folder holds predictions you brought, rather than a run made by predicting.
-
-        The difference matters for rows with no prediction. A run made by predicting keeps a record of every
-        row it attempted, so a row with no record and no prediction is pending. A folder you brought has no
-        records, so a row with no prediction is one your system didn't answer, and it fails."""
+        """Whether the folder holds predictions you brought, rather than a run made by predicting. A folder you
+        brought has no records, no question and no rows of its own: it is graded over the whole manifest."""
         return not self.settings().get("provider")
 
-    def check_settings(self, dataset: str | Path, manifest: str, task: dict[str, Any]) -> None:
-        """Refuses a folder that holds answers for another dataset, manifest or task (`Task.identity`).
+    def selection(self) -> dict[str, Any]:
+        """The choice of rows the run answers (`data.selection`), as its settings.json says: `{}` for every row,
+        and for a folder you brought."""
+        return self.settings().get("rows", {})
 
-        A row's files are named by its id alone. So answers for another dataset kept in this folder would be
-        graded against this dataset's gold, and answers to another task (another variant of the input) would
-        be mixed with this one's."""
+    def check_settings(self, question: Mapping[str, Any]) -> None:
+        """Refuses grading a run with another dataset, manifest or task than the one it answers.
+
+        A row's files are named by its id alone. So answers for another dataset would be graded against this
+        dataset's gold, and answers to another task (another variant of the input) against the wrong outputs."""
         said = self.settings()
-        for key, now in (("dataset", data.dataset_id(dataset)), ("manifest", data.manifest_path(manifest)),
-                         ("task", task)):
-            if (was := said.get(key)) and was != now:
-                raise errors.UsageError(f"{self.folder} holds a run on {key} {was}, not {now}: a run folder holds "
-                                        "one dataset, one manifest and one task; use another folder")
+        for key in ("dataset", "manifest", "task"):
+            if (was := said.get(key)) and was != question[key]:
+                raise errors.UsageError(f"{self.folder} answers {key} {_spelled(was)}, not {_spelled(question[key])}: "
+                                        f"grade it with the {key} it was run on")
 
-    def write_settings(self, dataset: str | Path, manifest: str, root: Path, task: dict[str, Any],
-                       **fields: Any) -> None:
-        """Writes settings.json: `fields`, then the dataset, the commit it was read at, the manifest and the
-        task. `check_settings` compares every later use of the folder against these."""
-        self.folder.mkdir(parents=True, exist_ok=True)
-        c = data.commit(dataset, root)
-        write_json(self.folder / "settings.json", {**fields, "dataset": data.dataset_id(dataset),
-                                                   **({"commit": c} if c else {}),
-                                                   "manifest": data.manifest_path(manifest), "task": task})
-
-    def prepare(self, dataset: str | Path, manifest: str, root: Path, task: dict[str, Any], timeout: float) -> None:
-        """Makes the run's folders, and writes what it asks (its system, options and timeout) to settings.json.
-        This happens before the first call, so even a run stopped at its first row says what it was."""
+    def prepare(self, question: Mapping[str, Any], commit: str | None, timeout: float) -> None:
+        """Makes the run's folders, and writes its question, the dataset's commit and the timeout to
+        settings.json. This happens before the first call, so even a run stopped at its first row says what it
+        was."""
         assert self.system is not None, "only a run with a system predicts"
         self.predictions.mkdir(parents=True, exist_ok=True)
         self.records.mkdir(parents=True, exist_ok=True)
-        self.write_settings(dataset, manifest, root, task, run=self.name, provider=self.system.name,
-                            settings=self.system.options(), timeout_s=timeout)
+        write_json(self.folder / "settings.json", {"run": self.name, "provider": self.system.name,
+                                                   "settings": self.system.options(), **question,
+                                                   **({"commit": commit} if commit else {}), "timeout_s": timeout})
 
     def record(self, id: str) -> dict[str, Any] | None:
         """The row's record, or None when it has none or the file can't be read."""
@@ -224,6 +224,25 @@ class Run:
             if c := (self.record(i) or {}).get("cost"): yield c
 
 
+def _spelled(x: Any) -> str:
+    """A dataset, manifest or task as a message writes it: a task as its name and options, `parse (outputs=html)`."""
+    if not isinstance(x, dict): return str(x)
+    opts = ", ".join(f"{k}={' '.join(map(str, v)) if isinstance(v, list) else v}"
+                     for k, v in x.get("options", {}).items())
+    return f"{x.get('name')}" + (f" ({opts})" if opts else "")
+
+
+def folder_name(system: adapter.Adapter, question: Mapping[str, Any]) -> str:
+    """The name of the folder of `system`'s run on `question`: the system's `label`, then a digest of the system,
+    every one of its options, and the question (dataset, manifest, task and rows).
+
+    The digest covers every option, not only those that differ from the defaults. Defaults change, and then
+    two configurations would share a folder and be averaged into one number."""
+    spelled = json.dumps({"provider": system.name, "settings": system.options(), **question}, sort_keys=True,
+                         default=str)
+    return f"{re.sub(r'[^A-Za-z0-9._-]+', '_', system.label)}-{hashlib.sha256(spelled.encode()).hexdigest()[:8]}"
+
+
 def total(costs: Iterable[dict[str, Any]]) -> dict[str, float | None]:
     """What the calls cost together, in dollars and in credits.
 
@@ -233,6 +252,22 @@ def total(costs: Iterable[dict[str, Any]]) -> dict[str, float | None]:
         if c.get("usd") is not None: usd = (usd or 0.0) + c["usd"]
         if c.get("credits") is not None: credits = (credits or 0.0) + c["credits"]
     return {"usd": None if usd is None else round(usd, 4), "credits": None if credits is None else round(credits, 4)}
+
+
+def write_bug(path: Path, exc: BaseException, cls: type, **context: Any) -> None:
+    """Saves what a report of a bug in `cls` needs to `path`: the traceback, `context` (the system and its
+    options, the row), and the versions of `cls`'s package, of this one and of Python. Never the document, so
+    the file can be attached to a public issue."""
+    import importlib.metadata
+    import traceback
+
+    p = errors.package(cls)
+    about = {**context, "class": f"{cls.__module__}.{cls.__qualname__}",
+             "package": f"{p[0]} {p[1]}" if p else "none: your own code",
+             "omni-bench-core": importlib.metadata.version("omni-bench-core"), "python": platform.python_version(),
+             "time": datetime.datetime.now().isoformat(timespec="seconds")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text(path, json.dumps(about, indent=2, default=str) + "\n\n" + "".join(traceback.format_exception(exc)))
 
 
 def write_json(path: Path, obj: Any) -> None:

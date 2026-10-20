@@ -8,13 +8,9 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
 from omni_bench_core import data, errors
-
-if TYPE_CHECKING:
-    from omni_bench_core import adapter, scorer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,8 +27,8 @@ class Task[R: data.Row, I]:
     the same output is a new scorer, and a new system is a new adapter. Neither needs a new task.
 
     `name` is the task's name. By default it is the class's name, in lower case. A task's fields are its
-    options, as for an adapter (`options()`). A run records the task's name and options, and refuses a
-    different task, so answers to `Segment("base")` and `Segment("hard")` never share a folder.
+    options, as for an adapter (`options()`). They are part of a run's question, so answers to
+    `Segment("base")` and `Segment("hard")` never share a folder.
     """
 
     name: ClassVar[str] = "task"
@@ -52,13 +48,6 @@ class Task[R: data.Row, I]:
         carries for scorers (tags, a language). None of that may reach a system. Raise `FileNotFoundError`
         when the row's input file is missing: the dataset is incomplete, so the row is skipped, not failed."""
         raise NotImplementedError(f"{type(self).__name__} has no input(row)")
-
-    def check(self, systems: Sequence[adapter.Adapter], scorers: Sequence[scorer.Scorer]) -> None:
-        """Refuses, before any call, a system these scorers can't fairly grade. By default it refuses nothing.
-
-        A task overrides it when its systems differ in what they can produce. For example, a parsing system
-        that can't produce layout blocks is refused when a scorer grades blocks, because every one of those
-        tests would fail and say nothing about how well it parses. `Benchmark.plan` calls it."""
 
     def options(self) -> dict[str, Any]:
         """Every option of the task, as a run's settings.json records them."""

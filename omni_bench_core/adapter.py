@@ -15,8 +15,8 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import difflib
-import hashlib
 import json
+import os
 import re
 import time
 import typing
@@ -97,15 +97,19 @@ class Adapter[I]:
 
     Its fields are the system's options, so an instance is one configuration, such as
     `Datalab(mode="accurate")`. Every field is written to the run's settings.json and is part of its folder's
-    name (`folder_name`). So one folder holds one configuration, and a run always says what it asked.
+    name (`run.folder_name`). So one folder holds one configuration, and a run always says what it asked.
 
     `call` is given the task's input (`Task.input`), which is what the system is sent. It is never given the
-    row, because the row holds the gold.
+    row, because the row holds the gold. It is called from `workers` threads at once, so anything it shares
+    across calls must be safe to use from several threads; a library that isn't (a PDF renderer, for one)
+    needs a lock around it.
 
     Everything else is optional and has a default:
 
         name      the name configs and run folders use; by default the class's name, in snake case
         read      turns a raw answer into the output; by default the output is the raw answer
+        keys      the environment variables it needs, such as its API key; checked before a run starts,
+                  so a missing key stops nothing half way; none
         workers   how many rows are in flight at once for this adapter; 5
         retries   how many more attempts after a transient failure; 3, waiting `backoff` seconds between
         label     the run folder's name before the digest; `name`
@@ -114,7 +118,7 @@ class Adapter[I]:
     HTTP 401 or 402, or a known phrase (`ACCOUNT_MARKERS`) in the system's error. An adapter overrides it
     when its system says so differently, or when one of those statuses can be about the row.
 
-    `options()` and `folder_name` are what a run records and is named after. They are not overridden.
+    `options()` is what a run records and is named after. It is not overridden.
 
     `predict` holds the rules every call follows, so no adapter writes them again: one time budget per row,
     transient failures retried, a failure that is an answer recorded, and a failure that is the same for
@@ -125,6 +129,7 @@ class Adapter[I]:
     """
 
     name: ClassVar[str]
+    keys: ClassVar[tuple[str, ...]] = ()
     workers: ClassVar[int] = 5
     retries: ClassVar[int] = 3
     backoff: ClassVar[tuple[float, ...]] = (20.0, 60.0, 120.0)
@@ -165,19 +170,15 @@ class Adapter[I]:
         body = (e.body or "") if (e.status or 0) >= 400 else ""
         return e.status in (401, 402) or any(m in f"{e} {body}".lower() for m in ACCOUNT_MARKERS)
 
+    def missing_keys(self) -> list[str]:
+        """The variables of `keys` that aren't set. Override it when an option can stand in for a key, such as
+        an `api_key` option given in the config."""
+        return [k for k in self.keys if not os.environ.get(k)]
+
     def options(self) -> dict[str, Any]:
         """Every option of the adapter. This is what its run's settings.json and records say it was asked."""
         errors.check_dataclass(type(self), Adapter)
         return dataclasses.asdict(self)
-
-    @property
-    def folder_name(self) -> str:
-        """The name of its run's folder: `label`, then a digest of its name and every option.
-
-        The digest covers every option, not only those that differ from the defaults. Defaults change, and
-        then two configurations would share a folder and be averaged into one number."""
-        spelled = json.dumps({"provider": self.name, **self.options()}, sort_keys=True, default=str)
-        return f"{re.sub(r'[^A-Za-z0-9._-]+', '_', self.label)}-{hashlib.sha256(spelled.encode()).hexdigest()[:8]}"
 
 
 class Budget:
@@ -290,13 +291,15 @@ def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict
 
     Failures are handled in three ways:
 
-    - a transient failure (a 429, a 5xx) is retried, up to `a.retries` times, within the row's budget;
+    - a transient failure (a 429, a 5xx) is retried, up to `a.retries` times, within the row's budget. An
+      answer that arrives after the budget is a timeout, so every system gets the same time;
     - any other failure is the row's answer. It is recorded as `error`, not raised, because it is a fact
       about this row; and
     - a `Stop`, or an account failure, is raised. It is the same for every row, and if it were recorded it
       would look like a settled answer that no resumed run tries again.
 
-    The record holds `provider`, `settings`, `output` (None on a failure), `raw`, `sent`, `error` (its type,
+    The record holds `provider`, `settings`, `package` (the adapter's package and version, so answers from two
+    versions of an adapter can be told apart), `output` (None on a failure), `raw`, `sent`, `error` (its type,
     status, whether it was transient, and its message), `cost` (with `wall_s` and `attempts`), `job_id`,
     `timeout_s` and `captured_at`.
     """
@@ -312,17 +315,29 @@ def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict
                 raise TypeError(f"{type(a).__name__}.call must return an adapter.Call, not a {type(got).__name__}")
             error = None
             break
-        except errors.VendorError as exc:
+        except errors.Stop:
+            raise
+        except Exception as exc:
+            if errors.refused(exc):
+                raise errors.Stop(f"{a.label} couldn't connect: the connection was refused ({str(exc)[:200]}). If it "
+                                  "calls a server you run, start it (or pass its base_url), then run the same command "
+                                  "again") from None
+            if not isinstance(exc, errors.VendorError): raise
             if a.account_failure(exc):
-                raise errors.AccountFailure(f"{a.name}: {str(exc)[:200]}") from None
+                raise errors.AccountFailure(f"{a.label}: {str(exc)[:200]}; fix the account (its key, its credits), "
+                                            "then run the same command again") from None
             if isinstance(exc.cost, Cost): spent.append(exc.cost)
             error = exc
             if not exc.transient or attempt == a.retries: break
             time.sleep(min(a.backoff[min(attempt, len(a.backoff) - 1)] if a.backoff else 0.0, budget.remaining()))
             if budget.expired():
-                error = errors.VendorTimeout(f"the {timeout:.0f}s budget was spent over {attempts} attempts; "
+                error = errors.VendorTimeout(f"the {timeout:g} s budget was spent over {attempts} attempts; "
                                              f"last failure: {exc}"[:400])
                 break
+    # Note: an adapter is asked to keep to its budget, but nothing makes it; an answer that came after the budget
+    # is a timeout like any other, so every system gets the same time. The answer is kept: it was paid for.
+    if error is None and (wall := time.time() - started) > timeout:
+        error = errors.VendorTimeout(f"answered after {wall:.1f} s, past the {timeout:g} s budget")
     rec = record(a, got, error, attempts=attempts, timeout=timeout, wall_s=round(time.time() - started, 1),
                  at=time.strftime("%Y-%m-%dT%H:%M:%S"), spent=spent)
     return rec if error is not None else reread(a, x, rec)
@@ -335,13 +350,16 @@ def record(a: Adapter, got: Call | None, error: errors.VendorError | None, *, at
     Its cost is every attempt's cost added up: the failed attempts that were paid for (`spent`), and the
     answer. Its `output` is filled in afterwards by `reread`, which `predict` calls when there is an answer."""
     costs = [*spent, *([got.cost] if got is not None else [])]
-    rec = {"provider": a.name, "settings": a.options(), "output": None, "raw": None, "sent": None, "error": None,
+    p = errors.package(type(a))
+    rec = {"provider": a.name, "settings": a.options(), "package": f"{p[0]} {p[1]}" if p else None,
+           "output": None, "raw": None, "sent": None, "error": None,
            "cost": {**Cost.total(costs)._asdict(), "wall_s": wall_s, "attempts": attempts}, "job_id": None,
            "timeout_s": timeout, "captured_at": at}
     if got is not None:
         rec |= {"raw": got.raw, "sent": got.sent, "job_id": got.job_id}
     if error is not None:
-        rec |= {"raw": error.body, "sent": error.sent, "job_id": error.job_id, "error": _failure(error)}
+        rec |= {"error": _failure(error)}
+        if got is None: rec |= {"raw": error.body, "sent": error.sent, "job_id": error.job_id}
     return rec
 
 

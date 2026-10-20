@@ -9,7 +9,7 @@ package runs the loop.
 from omni_bench_core import benchmark
 
 b = benchmark.Benchmark(SomeTask(), "hf://datasets/<org>/<name>", [SomeScorer()])
-b.run([SomeAdapter(mode="accurate")], out="runs", sample=20)   # plan, predict, grade
+b.run(SomeAdapter(mode="accurate"), out="runs", sample=20)     # plan, predict, grade
 b.grade("mine/")                                                # a folder of your own predictions
 ```
 
@@ -17,7 +17,7 @@ What you write, from least to most:
 
 | to | write |
 | --- | --- |
-| run a benchmark | `Benchmark(task, dataset, scorers).run([SomeAdapter(...)], out)` |
+| run a benchmark | `Benchmark(task, dataset, scorers).run(SomeAdapter(...), out)`, once per system |
 | add a system | an `Adapter`: a frozen dataclass of its options, and `call(input) -> Call` |
 | add a way of grading | a `Scorer`: a frozen dataclass, `gold(row)` and `score(pred, gold) -> Score` |
 | add a task | a `Task`: `rows(dataset)` and `input(row)`, a row type, and its adapters and scorers |
@@ -25,7 +25,8 @@ What you write, from least to most:
 Where to read next:
 
 - `OVERVIEW.md`: the pieces one at a time, with diagrams. Start here if you are new;
-- `tests/test_core.py`: a whole toy task in about 100 lines (`PYTHONPATH=. python tests/test_core.py`); and
+- [`tests/test_core.py`](https://github.com/datalab-to/omni-bench-core/blob/main/tests/test_core.py): a whole toy task, with a test of every rule (from a clone:
+  `PYTHONPATH=. python tests/test_core.py`); and
 - the class docstrings in `omni_bench_core/`: what each method is for, and when you would write it.
 
 Two limits are deliberate:

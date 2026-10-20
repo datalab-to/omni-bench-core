@@ -79,37 +79,71 @@ def download_dataset(dataset: str | Path) -> Path:
     """The dataset as a folder on disk.
 
     A folder is returned as it is. A HuggingFace dataset is downloaded whole, at one commit, into the
-    HuggingFace cache. A later run finds it there and downloads nothing, and a second call in the same
-    process doesn't even ask the Hub: planning, predicting and grading all need the folder."""
+    HuggingFace cache, even when only a few rows are run: a run's folder and its grading need the whole
+    dataset. A later run finds it there and downloads nothing, and a second call in the same process doesn't
+    even ask the Hub: planning, predicting and grading all need the folder."""
     if (at := hf_dataset(dataset)) is None:
         root = Path(dataset).expanduser()
         if not root.is_dir():
             raise errors.UsageError(f"no dataset folder at {root}; pass a folder or {HF_PREFIX}<org>/<name>")
         return root
     repo, revision = at
-    import huggingface_hub
+    huggingface_hub = hub()
     from huggingface_hub import errors as hf_errors
+
+    cached = _cached(repo, revision)
+    # Note: a cached dataset still asks the Hub for its latest commit, but shows no progress bars for files
+    # it already has.
+    if cached: huggingface_hub.utils.disable_progress_bars()
+    if huggingface_hub.get_token() is None and not cached:
+        log.info("downloading %s, all of it, once; later runs use the copy in the HuggingFace cache. Tip: set "
+                 "HF_TOKEN (or run `hf auth login`) to download faster and avoid the Hub's rate limits", dataset)
 
     # Note: we try again because a dataset is hundreds of files, the Hub drops some requests under that load,
     # and a new attempt resumes where the last one stopped. A missing repo or missing access fails at once,
     # because it would fail the same way every time.
-    for attempt in range(DOWNLOAD_ATTEMPTS):
-        try:
-            return Path(huggingface_hub.snapshot_download(repo, repo_type="dataset", revision=revision, max_workers=4))
-        except (hf_errors.RepositoryNotFoundError, hf_errors.GatedRepoError, hf_errors.RevisionNotFoundError) as exc:
-            raise errors.UsageError(f"can't read dataset {dataset}: {type(exc).__name__}; check the repo and "
-                                    "revision, and that you're logged in with access (hf auth login)") from None
-        except (hf_errors.LocalEntryNotFoundError, hf_errors.OfflineModeIsEnabled) as exc:
-            how = ("HF_HUB_OFFLINE is set; unset it" if os.environ.get("HF_HUB_OFFLINE", "") not in ("", "0")
-                   else "the Hub can't be reached; connect")
-            raise errors.UsageError(f"can't read dataset {dataset}: it isn't cached and {how}, or pass a folder "
-                                    f"({type(exc).__name__})") from None
-        except Exception as exc:
-            if attempt == DOWNLOAD_ATTEMPTS - 1: raise
-            log.warning("downloading %s failed (%s: %s); trying again in %ds", dataset, type(exc).__name__,
-                        str(exc)[:200], 30 * (attempt + 1))
-        time.sleep(30 * (attempt + 1))
+    try:
+        for attempt in range(DOWNLOAD_ATTEMPTS):
+            try:
+                return Path(huggingface_hub.snapshot_download(repo, repo_type="dataset", revision=revision,
+                                                              max_workers=4))
+            except (hf_errors.RepositoryNotFoundError, hf_errors.GatedRepoError,
+                    hf_errors.RevisionNotFoundError) as exc:
+                raise errors.UsageError(f"can't read dataset {dataset}: {type(exc).__name__}; check the repo and "
+                                        "revision, and that you're logged in with access (hf auth login)") from None
+            except (hf_errors.LocalEntryNotFoundError, hf_errors.OfflineModeIsEnabled) as exc:
+                how = ("HF_HUB_OFFLINE is set; unset it" if os.environ.get("HF_HUB_OFFLINE", "") not in ("", "0")
+                       else "the Hub can't be reached; connect")
+                raise errors.UsageError(f"can't read dataset {dataset}: it isn't cached and {how}, or pass a folder "
+                                        f"({type(exc).__name__})") from None
+            except Exception as exc:
+                if attempt == DOWNLOAD_ATTEMPTS - 1: raise
+                log.warning("downloading %s failed (%s: %s); trying again in %ds", dataset, type(exc).__name__,
+                            str(exc)[:200], 30 * (attempt + 1))
+            time.sleep(30 * (attempt + 1))
+    finally:
+        if cached: huggingface_hub.utils.enable_progress_bars()
     raise AssertionError("unreachable")
+
+
+def hub() -> Any:
+    """The `huggingface_hub` module, which reading an `hf://` dataset needs."""
+    try:
+        import huggingface_hub
+    except ImportError:
+        raise errors.MissingDependency("reading an hf:// dataset needs huggingface_hub: pip install huggingface_hub "
+                                       "(a benchmark package's [benchmark] extra includes it), or pass a dataset "
+                                       "folder") from None
+    return huggingface_hub
+
+
+def _cached(repo: str, revision: str | None) -> bool:
+    """Whether the dataset is already in the HuggingFace cache, asking nothing of the Hub."""
+    try:
+        hub().snapshot_download(repo, repo_type="dataset", revision=revision, local_files_only=True)
+    except Exception:  # noqa: BLE001 -- any reason it isn't there means it isn't cached
+        return False
+    return True
 
 
 def dataset_id(dataset: str | Path) -> str:
@@ -213,6 +247,19 @@ def unique(ids: Sequence[str], path: Path) -> None:
                                 + "; ".join(" and ".join(xs) for xs in twice[:3]))
 
 
+def selection(suites: Iterable[str] | None = None, limit: int = 0, sample: int = 0,
+              only: Iterable[str] | None = None) -> dict[str, Any]:
+    """A choice of rows, written the same way every time: only what was given, names sorted. It is part of
+    a run's question, so it names the run's folder, and grading reads it back to know which rows the run
+    answers. `{}` is every row."""
+    out: dict[str, Any] = {}
+    if (s := _names(suites, "suites")) is not None: out["suites"] = sorted(s)
+    if (o := _names(only, "only")) is not None: out["only"] = sorted(o)
+    if sample: out["sample"] = sample
+    if limit: out["limit"] = limit
+    return out
+
+
 def select[R: Row](rows: Sequence[R], suites: Iterable[str] | None = None, limit: int = 0, sample: int = 0,
                    only: Iterable[str] | None = None) -> tuple[R, ...]:
     """The rows to run, in their order. The filters apply in this order:
@@ -222,12 +269,16 @@ def select[R: Row](rows: Sequence[R], suites: Iterable[str] | None = None, limit
     3. `sample`: this many rows, spread evenly over the suites; and
     4. `limit`: the first this many rows.
 
-    `sample` takes one row from each suite in turn, evenly spaced within the suite. So a quick run sees every
-    kind of row, and sees the same rows each time."""
+    `sample` takes one row from each suite in turn, evenly spaced within the suite. So a run sees every kind
+    of row, and sees the same rows each time: two systems run with the same `sample` answer the same rows.
+    `sample` and `limit` are two ways to say how many rows, so only one may be given."""
     suites, only = _names(suites, "suites"), _names(only, "only")
     for name, n in (("limit", limit), ("sample", sample)):
         if isinstance(n, bool) or not isinstance(n, int): raise TypeError(f"{name} is a whole number, not {n!r}")
         if n < 0: raise errors.UsageError(f"{name} is {n}; it counts rows, so give 0 (no limit) or more")
+    if limit and sample:
+        raise errors.UsageError(f"give sample ({sample}) or limit ({limit}), not both: sample spreads its rows over "
+                                "every suite, limit takes the first ones")
     xs = tuple(rows)
     known = {r.suite for r in xs}
     if suites is not None and (bad := sorted(suites - known)):
@@ -272,7 +323,7 @@ def _on_hub(dataset: str | Path, manifest: str) -> None:
     the Hub doesn't show is reported as that, not as a missing manifest. When the Hub doesn't answer, the
     download goes ahead, and a manifest that really is missing is reported after it."""
     if (at := hf_dataset(dataset)) is None: return
-    import huggingface_hub
+    huggingface_hub = hub()
 
     try:
         if not huggingface_hub.repo_exists(at[0], repo_type="dataset"):

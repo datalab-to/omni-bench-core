@@ -1,24 +1,26 @@
 """The errors a user can meet, kept apart from our own bugs.
 
-There are four kinds:
+There are five kinds:
 
 - `UsageError`: what was asked is wrong, such as a bad option, dataset, manifest or file. Fix it and ask
-  again;
+  again. `Unfinished` is one: a run graded before every row has an answer and a score;
 - `Stop`: the run can't go on, and the reason is the same for every row, such as an account that can't
   pay, a missing key or a missing dependency. Fix it and run again;
-- `VendorError`: one call to a system failed. It is recorded as that row's answer, so a resumed run knows
-  the row was tried. It is retried first when it is `transient`; and
-- `Unscored`: a scorer couldn't score one row, for a reason that isn't the system's fault. The row waits
-  for a later grading.
+- `Bug`: an adapter or a scorer raised something that is neither an answer nor a known failure. The run
+  stops, the traceback is saved, and the message says whose code it is and where to report it;
+- `VendorError`: one call to a system failed. It is recorded as that row's answer, which counts as 0. It
+  is retried first when it is `transient`; and
+- `Unscored`: a scorer couldn't score one row, for a reason that isn't the system's fault. Grading isn't
+  finished until a later grading scores it.
 
-Anything else that is raised is a bug, either ours or an adapter's.
-
-This module also has two helpers: `counted` writes a count in a message, and `check_dataclass` refuses an
-adapter, scorer or task that forgot its dataclass decorator.
+This module also has helpers: `counted` writes a count in a message, `check_dataclass` refuses an adapter,
+scorer or task that forgot its dataclass decorator, and `package` and `bug` say whose code a class is.
 """
 
 from __future__ import annotations
 
+import functools
+from pathlib import Path
 from typing import Any
 
 # Note: we decide whether a retry can help from the HTTP status, not from the message text. Two spellings
@@ -29,6 +31,14 @@ TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 523, 524
 
 class UsageError(ValueError):
     """What was asked is wrong. The message says what was wrong, the value given, and how to fix it."""
+
+
+class Unfinished(UsageError):
+    """A run graded before it is finished: some of its rows have no answer yet, or no score yet.
+
+    Grading refuses it, because a headline over part of the rows can't be told apart from one over all of
+    them. The message lists the rows, and the two ways on: finish them, or grade with `partial`, which counts
+    them as failed."""
 
 
 class Stop(Exception):
@@ -42,7 +52,7 @@ class Unscored(Exception):
     """A scorer couldn't score a row, for a reason that isn't the system's fault, such as a judge that
     didn't answer.
 
-    The row counts as neither scored nor failed. The headline stays empty until a later grading scores it."""
+    The row counts as neither scored nor failed, so grading isn't finished until a later grading scores it."""
 
 
 class AccountFailure(Stop):
@@ -58,6 +68,12 @@ class MissingCredential(Stop):
 
 class MissingDependency(ImportError, Stop):
     """An adapter could not import a package it needs."""
+
+
+class Bug(Stop):
+    """An adapter or a scorer raised something that is neither an answer nor a failure we know of: a bug in
+    its code, not a failure of the system. The message says whose code it is and where its traceback was
+    saved (`bug`)."""
 
 
 class VendorError(RuntimeError):
@@ -148,3 +164,55 @@ def check_dataclass(cls: type, base: type) -> None:
             raise TypeError(f"{c.__name__} declares {', '.join(loose)} but is not a dataclass, so "
                             f"{'they are' if len(loose) > 1 else 'it is'} not an option: decorate it with "
                             "@dataclasses.dataclass(frozen=True)")
+
+
+@functools.cache
+def package(cls: type) -> tuple[str, str, str | None] | None:
+    """The installed package `cls` comes from: its name, its version, and its GitHub page when it names one.
+    None for a class in no installed package, such as one defined in a script or a notebook."""
+    import importlib.metadata as md
+
+    for dist in md.packages_distributions().get(cls.__module__.split(".")[0], []):
+        meta = md.metadata(dist)
+        urls = [u.split(",", 1)[-1].strip() for u in meta.get_all("Project-URL") or []] + [meta.get("Home-page") or ""]
+        return meta["Name"], meta["Version"], next((u.rstrip("/") for u in urls if "github.com/" in u), None)
+    return None
+
+
+def refused(exc: BaseException) -> bool:
+    """Whether `exc`, or an exception it was raised from, is a refused connection: nothing listens at the
+    address. That is the same for every row, so it stops the run, rather than failing each row or passing for
+    a bug in the adapter."""
+    import errno
+
+    # Note: by type, never by message: a vendor's own error text can say "connection refused" about its servers.
+    while exc is not None:
+        if isinstance(exc, ConnectionRefusedError) or (isinstance(exc, OSError) and exc.errno == errno.ECONNREFUSED):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def bug(what: str, exc: BaseException, cls: type, saved: Path | None = None) -> Bug:
+    """The `Bug` to raise when `cls`'s code raised `exc` while doing `what` ("predicting doc_17"), whose
+    traceback was saved to `saved` (or, when nothing was saved, is shown in full). It says whose code it is:
+    an installed package's, with where to report it, or your own class's, with its file."""
+    import inspect
+    import traceback
+
+    head = f"{cls.__name__} raised {type(exc).__name__} while {what}: {str(exc)[:200]}"
+    attach = f", attaching {saved}" if saved else ", with the traceback below"
+    if (p := package(cls)) is not None:
+        name, version, home = p
+        where = f"report it at {home}/issues" if home else f"report it to {name}'s authors"
+        body = f"this is a bug in {name} {version}, not a failure of the system; {where}{attach}"
+    else:
+        try:
+            file = inspect.getfile(cls)
+        except TypeError:
+            file = cls.__module__
+        body = f"this is a bug in your {cls.__name__} ({file}), not a failure of the system" + (
+            f"; its traceback is in {saved}" if saved else "")
+    tb = "".join(traceback.format_exception(exc)).rstrip()
+    keep = " The file holds the traceback and the options, never the document." if saved else ""
+    return Bug(f"{head}\n{body}.{keep} Run the same command again after a fix.\n{tb}")
