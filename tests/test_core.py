@@ -651,7 +651,7 @@ def test_a_refused_connection_stops_the_run(tmp: Path) -> None:
     else:
         raise AssertionError("a refused connection didn't stop the run")
     [folder] = (tmp / "runs").iterdir()
-    assert not any((folder / "records").iterdir()) and not (folder / "bugs").exists()
+    assert not any((folder / "records").iterdir())
 
 
 def test_a_selection_of_every_row_is_every_row(tmp: Path) -> None:
@@ -668,10 +668,10 @@ def test_a_scorer_bug_names_its_row(tmp: Path) -> None:
     try:
         b.run(GoldEcho(), tmp / "runs")
     except errors.Bug as exc:
-        assert "Crashes raised KeyError while scoring a2" in str(exc), exc
+        assert "Crashes raised KeyError while scoring a2" in str(exc) and "Traceback" in str(exc), exc
     else:
         raise AssertionError("a bug in a scorer was not raised")
-    assert (tmp / "runs" / name / "crashes" / "bugs" / "a2.txt").exists()
+    assert not (tmp / "runs" / name / "crashes" / "summary.json").exists()
 
 
 def test_a_missing_key_is_refused_before_any_call(tmp: Path) -> None:
@@ -686,7 +686,7 @@ def test_a_missing_key_is_refused_before_any_call(tmp: Path) -> None:
     assert CALLS == [] and not (tmp / "runs").exists()
 
 
-def test_a_bug_stops_the_run_and_saves_its_traceback(tmp: Path) -> None:
+def test_a_bug_stops_the_run_and_prints_its_traceback(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"))
     try:
         b.run(Buggy(), tmp / "runs", workers=1)
@@ -695,10 +695,10 @@ def test_a_bug_stops_the_run_and_saves_its_traceback(tmp: Path) -> None:
     else:
         raise AssertionError("a bug in an adapter was not raised")
     [folder] = (tmp / "runs").iterdir()
-    saved = folder / "bugs" / "b1.txt"
-    assert "Buggy raised KeyError while predicting b1" in msg and "bug in your Buggy" in msg and str(saved) in msg, msg
-    assert "Traceback" in msg and "KeyError" in saved.read_text() and '"row": "b1"' in saved.read_text()
-    assert not (folder / "records" / "b1.json").exists()
+    assert "Buggy raised KeyError while predicting b1" in msg and "bug in your Buggy" in msg, msg
+    assert "Traceback" in msg and "omni-bench-core 0.3" in msg and "Python 3." in msg, msg
+    assert not (folder / "records" / "b1.json").exists() and sorted(p.name for p in folder.iterdir()) == [
+        "predictions", "records", "settings.json"]
 
 
 def test_sample_spreads_over_suites(tmp: Path) -> None:

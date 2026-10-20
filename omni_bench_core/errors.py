@@ -20,7 +20,6 @@ scorer or task that forgot its dataclass decorator, and `package` and `bug` say 
 from __future__ import annotations
 
 import functools
-from pathlib import Path
 from typing import Any
 
 # Note: we decide whether a retry can help from the HTTP status, not from the message text. Two spellings
@@ -193,26 +192,27 @@ def refused(exc: BaseException) -> bool:
     return False
 
 
-def bug(what: str, exc: BaseException, cls: type, saved: Path | None = None) -> Bug:
-    """The `Bug` to raise when `cls`'s code raised `exc` while doing `what` ("predicting doc_17"), whose
-    traceback was saved to `saved` (or, when nothing was saved, is shown in full). It says whose code it is:
-    an installed package's, with where to report it, or your own class's, with its file."""
+def bug(what: str, exc: BaseException, cls: type) -> Bug:
+    """The `Bug` to raise when `cls`'s code raised `exc` while doing `what` ("predicting doc_17"). Its message
+    says whose code it is (an installed package's, with where to report it, or your own class's, with its
+    file), the versions a report needs, and the whole traceback."""
+    import importlib.metadata
     import inspect
+    import platform
     import traceback
 
     head = f"{cls.__name__} raised {type(exc).__name__} while {what}: {str(exc)[:200]}"
-    attach = f", attaching {saved}" if saved else ", with the traceback below"
     if (p := package(cls)) is not None:
         name, version, home = p
         where = f"report it at {home}/issues" if home else f"report it to {name}'s authors"
-        body = f"this is a bug in {name} {version}, not a failure of the system; {where}{attach}"
+        body = f"this is a bug in {name} {version}, not a failure of the system; {where}, with this message"
     else:
         try:
             file = inspect.getfile(cls)
         except TypeError:
             file = cls.__module__
-        body = f"this is a bug in your {cls.__name__} ({file}), not a failure of the system" + (
-            f"; its traceback is in {saved}" if saved else "")
+        body = f"this is a bug in your {cls.__name__} ({file}), not a failure of the system"
+    versions = (f"omni-bench-core {importlib.metadata.version('omni-bench-core')}, "
+                f"Python {platform.python_version()}")
     tb = "".join(traceback.format_exception(exc)).rstrip()
-    keep = " The file holds the traceback and the options, never the document." if saved else ""
-    return Bug(f"{head}\n{body}.{keep} Run the same command again after a fix.\n{tb}")
+    return Bug(f"{head}\n{body}. Run the same command again after a fix.\n({versions})\n{tb}")

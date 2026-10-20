@@ -159,7 +159,7 @@ You don't write retries, timeouts or error handling. The core wraps every call i
       +-- past the timeout        -> recorded as a timeout, even if an answer came later
       +-- 401, 402 (the account)  -> the whole run stops, since every row would fail
       +-- connection refused      -> the whole run stops: nothing listens at the address
-      +-- any other exception     -> a bug: the run stops and its traceback is saved
+      +-- any other exception     -> a bug: the run stops and prints its traceback
 ```
 
 What your `call` raises decides which of these happens:
@@ -169,8 +169,8 @@ What your `call` raises decides which of these happens:
 - `errors.Stop(message)`, or one of its kinds (`MissingCredential`, `AccountFailure`): the run can't go on
   for any row. Say what to fix in the message. Declaring `keys` makes the core raise `MissingCredential`
   before any call, so you rarely raise it yourself; and
-- anything else: a bug in your adapter. The run stops, and the traceback is saved to `bugs/<id>.txt`. Those
-  files stay after a fix, as a record of what happened; delete them whenever you like.
+- anything else: a bug in your adapter. The run stops, and prints the whole traceback, whose code it is, and
+  the versions a bug report needs.
 
 ### Run
 
@@ -186,7 +186,6 @@ the task, and which rows (`suites`, `sample`, `limit`, `only`). The folder's nam
                                       the timeout
     records/a1.json                   everything about one row's call: output, raw answer, error, cost
     predictions/a1.json               just the output; this is what grading reads
-    bugs/a1.txt                       a traceback, only if the adapter's code crashed on that row
     exact/                            one folder per scorer
       scores.jsonl                    one line per row
       summary.json                    the summary, with its headline
@@ -372,7 +371,7 @@ What that means, case by case:
 | the system times out, or keeps answering 429 or 5xx | the row is recorded as failed, and the run goes on; an answer that comes after the timeout counts as a timeout | 0 | optionally run again with `retry_failed=True` (`--retry-failed`) |
 | your key is missing or wrong, or your account is out of credits | the run stops and says why; a missing key stops it before any call | not yet | fix it, then run the same command again |
 | a model server you host isn't running | the run stops and says so | not yet | start it, then run the same command again |
-| an adapter's code crashes while calling the system | the run stops, prints the traceback, saves it to `bugs/<id>.txt`, and says where to report it | not yet | report it; run the same command again after a fix |
+| an adapter's code crashes while calling the system | the run stops, prints the whole traceback, and says whose code it is and where to report it | not yet | report it; run the same command again after a fix |
 | an adapter's code can't read an answer (an error in `read`) | the row is recorded as an unreadable answer (`ReadError`), keeping the raw answer, and the run goes on | 0 | if it's the adapter's bug: fix `read`, then `reread` the run, which reads the saved answers again with no call |
 | you stop the run (Ctrl-C, a closed laptop) | nothing is lost | not yet | run the same command again |
 | a judge doesn't answer for a row | grading says that row isn't scored | not yet | grade again (kept scores aren't paid for again) |

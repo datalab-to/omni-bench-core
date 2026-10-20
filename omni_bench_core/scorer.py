@@ -162,8 +162,8 @@ class Scorer[R: data.Row, G, P]:
       and its judge (every Python file of the packages they come from) are unchanged; and
     - a grading's results are written only when it finishes. A cached scorer's cache is written as each row
       is scored, so an interrupted or unfinished grading keeps what its judge was paid for; and
-    - a scorer that raises anything else has a bug: grading stops, and the traceback is saved to
-      `<run>/<folder_name>/bugs/`.
+    - a scorer that raises anything else has a bug: grading stops, and prints its whole traceback and whose
+      code it is.
 
     A cached scorer's predictions, golds and results must be JSON (strings, numbers, booleans, None, lists
     and dicts). That way a row's key is the same in every process, and a kept score is exactly the score it
@@ -342,7 +342,7 @@ class Scorer[R: data.Row, G, P]:
                 failed, ready = self._read(run, chunk)
                 keys = self._keys(ready, code) if self.cache else {}
                 kept = _kept(home, keys)
-                fresh = self._scored(home, [t for t in ready if t[0].id not in kept])
+                fresh = self._scored([t for t in ready if t[0].id not in kept])
                 if self.cache:
                     fresh = {i: self._as_json(x) for i, x in fresh.items()}
                     _keep(home, keys, fresh)
@@ -385,9 +385,9 @@ class Scorer[R: data.Row, G, P]:
             ready.append((r, pred, self._gold(r)))
         return failed, ready
 
-    def _scored(self, home: Path, ready: Sequence[tuple[R, P, G]]) -> dict[str, Score]:
+    def _scored(self, ready: Sequence[tuple[R, P, G]]) -> dict[str, Score]:
         """`score_all` of the rows ready to score, by id. Checks that it gave one `Score` per row. A bug in the
-        scorer stops grading, with its traceback saved to `<home>/bugs/`."""
+        scorer stops grading (`errors.Bug`)."""
         if not ready: return {}
         rows, preds, golds = (list(xs) for xs in zip(*ready, strict=True))
         try:
@@ -396,11 +396,8 @@ class Scorer[R: data.Row, G, P]:
             raise
         except Exception as exc:
             row = getattr(exc, "row", None)
-            saved = home / "bugs" / f"{row or rows[0].id}.txt"
-            runs.write_bug(saved, exc, type(self), scorer=self.name, options=self.options(),
-                           **({"row": row} if row else {"rows": [r.id for r in rows]}))
             what = f"scoring {row}" if row else f"scoring {errors.counted(len(rows), 'row')} from {rows[0].id}"
-            raise errors.bug(what, exc, type(self), saved) from None
+            raise errors.bug(what, exc, type(self)) from None
         if len(got) != len(rows) or not all(isinstance(x, Score) for x in got):
             raise TypeError(f"{type(self).__name__}.score_all must return one scorer.Score per row: {len(rows)} "
                             f"rows, got {len(got)} values")

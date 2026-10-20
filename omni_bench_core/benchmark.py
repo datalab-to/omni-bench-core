@@ -60,7 +60,7 @@ class Benchmark:
     3. a failure that is the system's (a refusal, an error, an answer that can't be read, a timeout) is
        recorded, and the row counts 0. A failure that is ours (a missing key, an account that can't pay, a
        bug, an interrupt) stops the run with nothing recorded, so running the same command again does the
-       row. A bug's traceback is saved to `<run>/bugs/<id>.txt`.
+       row. A bug prints its whole traceback, and whose code it is.
 
     It has six methods:
 
@@ -274,14 +274,12 @@ def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: f
 
 def _saved(r: runs.Run, x: data.Row, f: cf.Future, board: progress.Board) -> BaseException | None:
     """Saves the record `f` holds for row `x` of run `r`, and returns None; or, when it raised, the failure to
-    stop the run with. A bug's traceback is saved to the run's bugs/ first."""
+    stop the run with: a bug in the adapter is raised as `errors.Bug`, which names whose code it is."""
     try:
         rec = f.result()
     except BaseException as exc:
         if isinstance(exc, Exception) and not isinstance(exc, errors.Stop):
-            saved = r.folder / "bugs" / f"{x.id}.txt"
-            runs.write_bug(saved, exc, type(r.system), system=r.system.name, options=r.system.options(), row=x.id)
-            return errors.bug(f"predicting {x.id}", exc, type(r.system), saved)
+            return errors.bug(f"predicting {x.id}", exc, type(r.system))
         return exc
     r.save(x.id, rec)
     board.saved(r.name, x.id, rec)

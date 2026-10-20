@@ -2,19 +2,17 @@
 
 `Run` is the folder and the bookkeeping over it. Its docstring says what the folder holds and the rules it
 follows. `folder_name` names a run's folder after the question it answers. `total` adds up costs.
-`write_bug` saves a bug's traceback. `write_json`, `write_text` and `write_lines` write a file whole, so a
+`write_json`, `write_text` and `write_lines` write a file whole, so a
 crash never leaves half a file.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import hashlib
 import json
 import logging
 import os
-import platform
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
@@ -37,7 +35,6 @@ class Run:
           settings.json           the question (system, options, dataset, manifest, task, rows) and the timeout
           records/<id>.json       everything `adapter.predict` returned for each row: the source of truth
           predictions/<id>.json   each row's output alone, which is all that grading reads
-          bugs/<id>.txt           the traceback of a bug in the adapter, if it had one on that row
           <scorer>/               each scorer's scores.jsonl, summary.json and details/
 
     Answers cost money and time, so each one is written to a file as it arrives. A run that stops resumes
@@ -252,22 +249,6 @@ def total(costs: Iterable[dict[str, Any]]) -> dict[str, float | None]:
         if c.get("usd") is not None: usd = (usd or 0.0) + c["usd"]
         if c.get("credits") is not None: credits = (credits or 0.0) + c["credits"]
     return {"usd": None if usd is None else round(usd, 4), "credits": None if credits is None else round(credits, 4)}
-
-
-def write_bug(path: Path, exc: BaseException, cls: type, **context: Any) -> None:
-    """Saves what a report of a bug in `cls` needs to `path`: the traceback, `context` (the system and its
-    options, the row), and the versions of `cls`'s package, of this one and of Python. Never the document, so
-    the file can be attached to a public issue."""
-    import importlib.metadata
-    import traceback
-
-    p = errors.package(cls)
-    about = {**context, "class": f"{cls.__module__}.{cls.__qualname__}",
-             "package": f"{p[0]} {p[1]}" if p else "none: your own code",
-             "omni-bench-core": importlib.metadata.version("omni-bench-core"), "python": platform.python_version(),
-             "time": datetime.datetime.now().isoformat(timespec="seconds")}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_text(path, json.dumps(about, indent=2, default=str) + "\n\n" + "".join(traceback.format_exception(exc)))
 
 
 def write_json(path: Path, obj: Any) -> None:
