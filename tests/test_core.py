@@ -830,8 +830,10 @@ class NoHeadline(Exact):
 
 @dataclasses.dataclass(frozen=True)
 class Status(Exact):
+    status: str = "ok"
+
     def score(self, pred, gold):
-        return scorer.Score({"status": "ok", "exact": pred == gold, "length": 1})
+        return scorer.Score({"status": self.status, "exact": pred == gold, "length": 1})
 
 
 def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(tmp: Path) -> None:
@@ -841,7 +843,9 @@ def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(
                                (0.5, "", '"headline_is" key')):
         refused(bench(tmp / "d", Headline(value, what)).run, GoldEcho(), tmp / f"runs-{value}-{what}", match=match)
     refused(bench(tmp / "d", NoHeadline()).run, GoldEcho(), tmp / "runs-nohead", match='a "headline" key')
-    refused(bench(tmp / "d", Status()).run, GoldEcho(), tmp / "runs-status", match="['status']")
+    for status in ("ok", "failed"):     # a scorer scores a row or leaves it unscored; only the core fails one
+        refused(bench(tmp / "d", Status(status)).run, GoldEcho(), tmp / f"runs-{status}",
+                match="can only score a row or leave it unscored")
     every = dataset(tmp / "refused", {"r1": ("", "refuse 1"), "r2": ("", "refuse 2")})
     s = bench(every).run(Copy(), tmp / "runs-none")["scorers"]["exact"]
     assert s["scored"] is None and s["headline"] == 0.0 and s["failed"] == 2, s   # summarize is never called

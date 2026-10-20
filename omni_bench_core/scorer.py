@@ -44,9 +44,10 @@ class Score(NamedTuple):
     details: list[dict[str, Any]] | None = None
 
     @classmethod
-    def failed(cls, why: str, traceback: str | None = None) -> Score:
-        """The score of a row with no usable prediction: the system's failure, counted as 0. `traceback` is where
-        the scorer said so, when it did (`prediction` raising `SystemFailed`)."""
+    def _failed(cls, why: str, traceback: str | None = None) -> Score:
+        """The score of a row with no usable prediction: the system's failure, counted as 0. Only `grade` makes it,
+        so a row fails only by the one rule. `traceback` is where the scorer said so, when it did (`prediction`
+        raising `SystemFailed`)."""
         return cls({"status": "failed", "error": errors.capped(why),
                     **({"traceback": errors.capped(traceback)} if traceback else {})})
 
@@ -358,20 +359,20 @@ class Scorer[R: data.Row, G, P]:
         ready: list[tuple[R, P, G]] = []
         for r in rows:
             if err := (run.record(r.id) or {}).get("error"):
-                failed[r.id] = Score.failed(f"{err['type']}: {err['message']}")
+                failed[r.id] = Score._failed(f"{err['type']}: {err['message']}")
                 continue
             try:
                 output = run.prediction(r.id)
             except FileNotFoundError:
-                failed[r.id] = Score.failed(f"no prediction: predictions/{r.id}.json")
+                failed[r.id] = Score._failed(f"no prediction: predictions/{r.id}.json")
                 continue
             except ValueError as exc:   # Note: the core's own check that the file is JSON
-                failed[r.id] = Score.failed(str(exc))
+                failed[r.id] = Score._failed(str(exc))
                 continue
             try:
                 pred = self.prediction(output)
             except errors.SystemFailed as exc:
-                failed[r.id] = Score.failed(str(exc), "".join(traceback.format_exception(exc)))
+                failed[r.id] = Score._failed(str(exc), "".join(traceback.format_exception(exc)))
                 continue
             except Exception as exc:
                 errors.noted(exc, type(self), f"reading the prediction of {r.id}")
@@ -394,6 +395,13 @@ class Scorer[R: data.Row, G, P]:
         if len(got) != len(rows) or not all(isinstance(x, Score) for x in got):
             raise TypeError(f"{type(self).__name__}.score_all must return one scorer.Score per row: {len(rows)} "
                             f"rows, got {len(got)} values")
+        # Note: a scorer scores a row or leaves it unscored; only the core fails a row (from its record, a missing
+        # prediction, or `prediction` raising SystemFailed), so that one rule decides every 0.
+        for r, x in zip(rows, got, strict=True):
+            if x.result.get("status", "unscored") != "unscored":
+                raise ValueError(f"{type(self).__name__} gave row {r.id} the status {x.result['status']!r}; a scorer "
+                                 "can only score a row or leave it unscored (Score.unscored). To fail a row for an "
+                                 "output it can't use, raise errors.SystemFailed in prediction()")
         return {r.id: x for r, x in zip(rows, got, strict=True)}
 
     def _keys(self, ready: Sequence[tuple[R, P, G]], code: str) -> dict[str, str]:
@@ -420,10 +428,8 @@ class Scorer[R: data.Row, G, P]:
 
     def _line(self, r: R, x: Score) -> Line:
         """A row's line: what the row is (id, status, row fields), then its score's numbers. A failed or unscored
-        row's result holds its own status (`Score.failed`, `Score.unscored`)."""
-        clash = sorted(set(x.result) & {"id", "row"}) or (
-            ["status"] if x.result.get("status", "failed") not in ("failed", "unscored") else [])
-        if clash:
+        row's result holds its own status (`Score._failed`, `Score.unscored`)."""
+        if clash := sorted(set(x.result) & {"id", "row"}):
             raise TypeError(f"{self.name}'s result for row {r.id} holds {clash}, which a line keeps for the row; "
                             "name them otherwise")
         return {"id": r.id, "status": "scored", **({"row": f} if (f := self.row_fields(r)) else {}), **x.result}

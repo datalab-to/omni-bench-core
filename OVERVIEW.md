@@ -251,7 +251,9 @@ Grading turns each row into one line of `scores.jsonl`, and all the lines into o
 
 A line is one row's grade, and scores.jsonl holds every row's. The core writes what the row is (`id`,
 `status`, and `row` when the scorer has `row_fields`), then the numbers `score` returned. A failed row's
-line holds its `error` instead.
+line holds its `error` instead. A scorer scores a row, or leaves it unscored (a judge that didn't answer:
+`errors.Unscored`, or `Score.unscored` from `score_all`); only the core fails a row, from its record, a missing
+prediction, or `prediction` raising `SystemFailed`. A result that gives itself any other status is refused.
 
 The handoff is `summarize`. Every scorer writes it, because only the scorer knows how its rows combine (a
 mean, or one rate over every row's counts). It is given only the scored rows' lines, without their status,
