@@ -1,14 +1,13 @@
 """Scorers: how a task's predictions are graded.
 
-`Scorer` is the class you subclass to add a way of grading, and its docstring says how. The rest of the
-module:
-
-- `Score`: what `Scorer.score` returns for one row; and
+- `Scorer`: the class to subclass for a way of grading;
+- `Score`: what `Scorer.score` returns for a scored row; and
 - `ask`: sends a judge (an adapter) one question, under the same rules as a system's calls.
 """
 
 from __future__ import annotations
 
+import abc
 import concurrent.futures as cf
 import dataclasses
 import functools
@@ -22,7 +21,7 @@ import sys
 import traceback
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple, final
 
 from omni_bench_core import adapter, data, errors
 from omni_bench_core import run as runs
@@ -37,32 +36,26 @@ POOLS = ("process", "thread")
 
 
 class Score(NamedTuple):
-    """One row's score. `result` is its numbers, one line of scores.jsonl. `details` is an optional breakdown
-    kept beside the lines, for finding where a system went wrong, never read by `summarize`."""
+    """A scored row's score. `result` is a small dict of the row's values, mostly numbers, which its line in
+    scores.jsonl holds; it may not use `id`, `status` or `row`, which the core writes. `details` is an optional
+    larger breakdown (a verdict per field, a judge's reasoning), written to `details/<id>.jsonl` and never read
+    by `summarize`."""
 
     result: dict[str, Any]
     details: list[dict[str, Any]] | None = None
 
-    @classmethod
-    def _failed(cls, why: str, traceback: str | None = None) -> Score:
-        """The score of a row with no usable prediction: the system's failure, counted as 0. Only `grade` makes it,
-        so a row fails only by the one rule. `traceback` is where the scorer said so, when it did (`prediction`
-        raising `SystemFailed`)."""
-        return cls({"status": "failed", "error": errors.capped(why),
-                    **({"traceback": errors.capped(traceback)} if traceback else {})})
 
-    @classmethod
-    def unscored(cls, why: str) -> Score:
-        """The score of a row the scorer couldn't score, for a reason that isn't the system's. Grading isn't
-        finished until a later grading scores it."""
-        return cls({"status": "unscored", "error": errors.capped(why)})
+class _Failed(NamedTuple):
+    """A row with no usable prediction, which counts 0. Only `grade` makes one: from the row's record, a missing
+    prediction, or `prediction` raising `SystemFailed` (with its `traceback`)."""
+
+    error: str
+    traceback: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
-class Scorer[R: data.Row, G, P]:
-    """One way of grading. Its fields are its options.
-
-    The smallest scorer is a frozen dataclass with three methods:
+class Scorer[R: data.Row, G, P](abc.ABC):
+    """One way of grading. A scorer is a frozen dataclass whose fields are its options:
 
         @dataclasses.dataclass(frozen=True)
         class Exact(scorer.Scorer):
@@ -75,99 +68,33 @@ class Scorer[R: data.Row, G, P]:
             def summarize(self, lines):           # the scored rows' lines as one summary
                 return {"headline": sum(x["exact"] for x in lines) / len(lines), "headline_is": "exact"}
 
-    Everything else is optional and has a default:
+    `gold` and `summarize` are abstract; `score` is required unless `score_all` is written instead. Optional,
+    with defaults:
 
-        name            the scorer's name; by default the class's name, in snake case
-        prediction      what the scorer reads of a prediction; by default the prediction as it is
-        row_fields      what of the row each line carries, under "row", for a summary to group by; nothing
-        check_gold      refuses a dataset before any call; by default it reads every gold
-        score_all       many rows' scores at once; by default `score` for each row
-        workers         how many rows are scored at once; 1
-        pool            what scores them at once: "process" for scoring that computes, "thread" for
-                        scoring that waits on calls; "process"
-        cache           whether to keep each row's score and reuse it while nothing it depends on changed;
-                        False
-        batch_size      how many rows are read and given to `score_all` at once; 500, or None for every row
+        name            the scorer's name; the class's name in snake case
+        prediction      what the scorer reads of a prediction; the prediction itself
+        row_fields      what of the row each line carries under "row"; nothing
+        check_gold      refuses a dataset before any call; reads every gold
+        score_all       many rows' scores at once; `score` for each row
+        workers         rows scored at once; 1
+        pool            "process" for scoring that computes, "thread" for scoring that waits on calls; "process"
+        cache           keep each row's score while its prediction, gold, options and code are unchanged; False
+        batch_size      rows read and given to `score_all` at once; 500, or None for all
 
-    What a score holds. `score` returns a `Score` with two parts. `result` is the row's numbers, which
-    become its line in scores.jsonl. `details` is optional: a breakdown too large for a line, such as one
-    verdict per field, a diff, or a judge's reasoning. It is written to `details/<id>.jsonl`. Every row's
-    result is kept in memory until the summary is made, so a result should be a few numbers. Anything large
-    goes in `details`, which is written after each batch and never held for the whole run.
+    A scorer scores a row (a `Score`) or leaves it unscored (`errors.Unscored`); only the core fails a row.
+    A judge is an adapter field, asked through `ask`, with `cache = True`, `pool = "thread"` and many
+    `workers`. A cached scorer's predictions, golds and results must be JSON.
 
-    Options. A scorer's fields are its options, as for an adapter. They are written to its summary, and they
-    are part of its results folder's name, `<run>/<name>-<digest>/` (or `<run>/<name>/` when it has none).
-    So two configurations of one scorer never overwrite each other.
+    The options are written to the summary and digested into the results folder's name,
+    `<run>/<name>-<digest>/`, so two configurations never overwrite each other. `grade` holds the rules and
+    can't be overridden:
 
-    There are four ways to grade, from most to least common:
-
-    1. `gold`, `score` and `summarize`. Use this when each row's score depends only on its prediction and
-       its gold;
-    2. the same, with `workers = N`, when scoring is slow to compute. The scorer, and each prediction and
-       gold, are sent to another process, so define the scorer in a module, or under
-       `if __name__ == "__main__":` in a script;
-    3. a judge. `score` asks a model with `ask`, through an adapter that is one of the scorer's fields. Set
-       `cache = True`, so each answer is paid for once and grading again gives the same scores. Set
-       `pool = "thread"` and `workers = N`, because a judge waits on calls. When the judge doesn't answer,
-       the row is unscored (`ask` raises `errors.Unscored`), and the next grading asks again for those rows
-       only:
-
-           @dataclasses.dataclass(frozen=True)
-           class Faithful(scorer.Scorer):
-               cache: ClassVar[bool] = True
-               pool: ClassVar[str] = "thread"
-               workers: ClassVar[int] = 16
-               judge: adapter.Adapter = OpenAI(model="gpt-5.5")
-
-               def score(self, pred, gold):
-                   rec = scorer.ask(self.judge, Prompt(pred, gold))
-                   return scorer.Score({"faithful": rec["output"]["verdict"] == "yes",
-                                        "judge_usd": rec["cost"]["usd"]}, [rec["output"]])
-
-    4. override `score_all(rows, preds, golds)`, when rows are scored together rather than one by one: a
-       judge or a model sent a batch, or a score that needs the other rows. It gets the same values `score`
-       would, for every row that has a prediction to score, and returns one `Score` per row
-       (`Score.unscored` for a row it couldn't score). It is given `batch_size` rows at a time; a score that
-       needs every row at once sets `batch_size = None`. With `cache = True` it is given only the rows
-       without a kept score.
-
-    How the methods fit together. `grade` does all the reading and writing, and applies every rule. The
-    methods it calls only compute:
-
-        grade(run, rows)                              reads files, applies the rules, writes; not overridden
-          gold(row), prediction(output)               each row's gold and prediction, read once
-          score_all(rows, preds, golds)               `batch_size` rows at a time, without kept scores
-            score(pred, gold)                         one row; by default called for each row
-          row_fields(row)                             each line's "row"
-          summarize(lines)                            the scored rows' lines as one summary
-
-    `grade` can't be overridden; a subclass that tries is refused. It holds the rules that make every
-    scorer's headline mean the same thing:
-
-    - only a finished run is graded: every row has an answer or a recorded failure, and a score. A row with
-      neither (never predicted, or no prediction in a folder of your own), or one the scorer couldn't score
-      (a judge that didn't answer), makes grading refuse (a `ValueError`), naming the rows and how to
-      finish them. `partial=True` grades anyway, counts those rows as failed, and says so in the summary
-      (`partial`: how many, and a few of their ids; scores.jsonl has each one);
-    - a row with no usable answer fails and counts as 0 in the headline. `summarize` is given only the scored
-      rows, and what it returns is kept under the summary's `scored`; `grade` multiplies its headline by
-      `coverage`, the share of rows scored rather than failed, so failing on hard rows can't raise it. Each
-      failed row is a line of scores.jsonl with its `error`, and its record holds the whole failure, so
-      failures can be found and audited;
-    - the same inputs get the same score. A scorer scores every row again on every grading. A cached scorer
-      keeps a row's score while the prediction, the gold, the scorer's options and the code of the scorer
-      and its judge (every Python file of the packages they come from) are unchanged; and
-    - a grading's results are written only when it finishes. A cached scorer's cache is written as each row
-      is scored, so an interrupted or unfinished grading keeps what its judge was paid for; and
-    - a scorer that raises anything else has a bug: grading stops, and the exception is raised as it is, with
-      a note naming the scorer and the row.
-
-    A cached scorer's predictions, golds and results must be JSON (strings, numbers, booleans, None, lists
-    and dicts). That way a row's key is the same in every process, and a kept score is exactly the score it
-    replaced.
-
-    A headline is a number from 0 to 1 where higher is better, and `grade` refuses any other: a failed row
-    counts as 0, which is only the worst score on that scale.
+        grade(run, rows)                    reads files, applies the rules, writes
+          gold(row), prediction(output)     each row's gold and prediction, read once
+          score_all(rows, preds, golds)     `batch_size` rows at a time, without kept scores
+            score(pred, gold)               one row
+          row_fields(row)                   each line's "row"
+          summarize(lines)                  the scored rows' lines as one summary
     """
 
     name: ClassVar[str]
@@ -187,85 +114,58 @@ class Scorer[R: data.Row, G, P]:
 
     @property
     def folder_name(self) -> str:
-        """The name of the scorer's results folder in a run: its name, then a digest of its options if it has
-        any."""
+        """The scorer's results folder in a run: its name, then a digest of its options if it has any."""
         o = self.options()
         if not o: return self.name
-        return f"{self.name}-{hashlib.sha256(json.dumps(o, sort_keys=True, default=str).encode()).hexdigest()[:8]}"
+        return f"{self.name}-{hashlib.sha256(json.dumps(o, sort_keys=True).encode()).hexdigest()[:8]}"
 
     def options(self) -> dict[str, Any]:
-        """Every option of the scorer, as its summary states them. A judge adapter appears as its name and
-        options."""
+        """The scorer's options, as its summary states them; a judge appears as its name and options."""
         errors.check_dataclass(type(self), Scorer)
         out = {}
         for f in dataclasses.fields(self):
             v = getattr(self, f.name)
             out[f.name] = {"system": v.name, **v.options()} if isinstance(v, adapter.Adapter) else v
+        errors.plain(out, f"{type(self).__name__}'s options")
         return out
 
+    @abc.abstractmethod
     def gold(self, row: R) -> G:
-        """The row's gold, read and checked.
-
-        Each scorer writes its own, because the shape of the gold belongs to the scorer. The dataset says
-        where a row's gold is (a gold file, a column), and the scorer says what it holds (unit tests, a
-        transcription, an extraction). Raise when it can't be read: the dataset is wrong for this scorer, so
-        grading stops and names the row."""
-        raise NotImplementedError(f"{type(self).__name__} has no gold(row)")
+        """The row's gold, read and checked. Raise when it can't be read: grading stops and names the row."""
 
     def prediction(self, output: Any) -> P:
-        """What the scorer reads of one prediction, which is `Adapter.read`'s output.
-
-        It is separate from `score` for two reasons. First, scorers of one task read different parts of one
-        output (the html, or the layout blocks). Second, a prediction that can't be used is the system's
-        failure, not a bug: raise `errors.SystemFailed`, and that row fails (counts as 0, with the traceback
-        in its line) while grading goes on. Anything else it raises is a bug, and stops grading."""
+        """What the scorer reads of one prediction (`Adapter.read`'s output). Raise `errors.SystemFailed` for an
+        output it can't use: the row fails and counts 0. Anything else it raises stops grading."""
         return output
 
     def score(self, pred: P, gold: G) -> Score:
-        """One row's score. This is the comparison itself, and the one method every scorer writes.
-
-        It should be pure: it reads no files, makes no calls, and uses nothing but its arguments. Then the
-        same answers always get the same scores, in any order and in any process. A scorer that asks a judge
-        isn't pure, so it sets `cache = True`, which gives the same guarantee. Raise `errors.Unscored` when the
-        row can't be scored for a reason that isn't the system's fault, such as a judge that didn't answer.
-        The row is then left for a later grading instead of counting against the system."""
+        """One row's score. Keep it pure (no files, no calls), or set `cache = True` when it asks a judge. Raise
+        `errors.Unscored` only when asking again may give a score (the judge timed out or was down): the row
+        waits for the next grading. Not abstract, since `score_all` can replace it; a scorer with neither is
+        refused."""
         raise NotImplementedError(f"{type(self).__name__} has no score(pred, gold)")
 
     def row_fields(self, row: R) -> dict[str, Any]:
-        """What of the row its line carries, under `"row"`. Use it for fields a summary breaks down by that the
-        row holds and the score doesn't, such as a source document, tags, or a language in `row.extra`.
-
-        It is separate from `gold` because nothing is graded against it. It goes on the line, rather than
-        being handed to `summarize` with the rows, so any part of a scores.jsonl can be summarized on its own."""
+        """What of the row its line carries under `"row"`: fields `summarize` groups by (a document, a language)."""
         return {}
 
+    @abc.abstractmethod
     def summarize(self, lines: Sequence[Line]) -> Summary:
-        """The scored rows' lines as one summary. Every scorer writes it, because rows combine in different
-        ways: a mean of each row's score, or one rate over all rows' counts.
+        """The scored rows' lines as one summary. Each line is `{"id", "row" (if any), ...the result's values}`;
+        failed rows are never given, and it isn't called when no row was scored.
 
-        Each line is a scored row's: its `id`, its `row` (`row_fields`, when there are any) and its result's
-        numbers. Failed rows are never given, and it is called only when at least one row was scored.
-
-        It returns `headline`, a number from 0 to 1 where higher is better, and `headline_is`, what the
-        headline is ("accuracy", "the mean of the families' scores"). Anything else it returns (a breakdown,
-        counts) is its own. `grade` keeps it all under the summary's `scored` and multiplies the headline by
-        coverage."""
-        raise NotImplementedError(f"{type(self).__name__} has no summarize")
+        Return `headline`, a number from 0 to 1 where higher is better, and `headline_is`, what it is
+        ("accuracy"); anything else is the scorer's own. `grade` keeps it under the summary's `scored` and
+        multiplies the headline by coverage."""
 
     def check_gold(self, rows: Sequence[R]) -> None:
-        """Refuses a dataset whose gold this scorer can't read. `plan` calls it before any call, so a wrong
-        dataset is found before answers are paid for. It reads every gold; override it when there is a
-        quicker check that is just as sure."""
+        """Refuses, before any call, a dataset whose gold this scorer can't read. Reads every gold by default."""
         for r in rows: self._gold(r)
 
-    def score_all(self, rows: Sequence[R], preds: Sequence[P], golds: Sequence[G]) -> list[Score]:
-        """Many rows' scores, in order. It is to many rows what `score` is to one.
-
-        It is the one place to change how rows are scored together: a batch sent to a judge, a model run
-        over many rows at once, or a score that needs the other rows. It gets values, never files, and only
-        for rows that have a prediction to score. Deciding which rows those are, and which rows are failed
-        or unfinished, is `grade`'s job. Return `Score.unscored` for a row it can't score. By default it calls
-        `score` for each row, `workers` at a time, in the scorer's `pool`."""
+    def score_all(self, rows: Sequence[R], preds: Sequence[P], golds: Sequence[G]) -> list[Score | errors.Unscored]:
+        """Many rows' scores, in order: a `Score` for each row, or an `errors.Unscored` (returned, not raised) for
+        a row it couldn't score. Override it to score rows together (a batch to a judge). It gets only rows with a
+        prediction. By default it calls `score` for each row, `workers` at a time, in `pool`."""
         if self.pool not in POOLS:
             raise TypeError(f"{type(self).__name__}.pool is {self.pool!r}; it is one of {POOLS}")
         ids = [r.id for r in rows]
@@ -281,25 +181,22 @@ class Scorer[R: data.Row, G, P]:
                              "\"__main__\":`, because each process imports the script again (macOS and "
                              "Windows); otherwise a process ran out of memory") from exc
 
+    @final
     def grade(self, run: runs.Run, rows: Sequence[R], *, partial: bool = False, details: bool = True,
               write: bool = True) -> Summary:
-        """Grades `run` on `rows`, writes the results under `<run>/<folder_name>/`, and returns the summary.
+        """Grades `run` on `rows`, writes the results under `<run>/<folder_name>/`, and returns the summary. In
+        order, it:
 
-        Every read and every rule is here. In order, it:
+        1. refuses a folder of your own that names none of the rows, and rebuilds lost predictions from records;
+        2. refuses rows with neither an answer nor a recorded failure, unless `partial`;
+        3. for each batch of `batch_size` rows: fails the rows the core knows failed, reuses kept scores,
+           scores the rest (`score_all`), and writes their details;
+        4. refuses unscored rows, unless `partial`, which counts them failed;
+        5. summarizes the scored lines (`summarize`), checks the summary, and multiplies its headline by
+           coverage; and
+        6. writes scores.jsonl and summary.json, only when grading finishes.
 
-        1. refuses a folder of your own whose files name none of the rows;
-        2. rebuilds lost predictions from their records;
-        3. refuses rows with neither an answer nor a recorded failure, unless `partial`;
-        4. for each batch: reads which rows failed, reads the others' predictions and golds, reuses kept
-           scores (`cache`), scores the rest (`score_all`), and writes their details;
-        5. refuses rows it couldn't score, unless `partial`;
-        6. makes the lines (with `row_fields`), and summarizes them (`summarize`);
-        7. applies the headline rule; and
-        8. writes the lines and the summary.
-
-        `rows` are the rows the run answers. `write=False` grades by the same rules and writes no results,
-        for trying a scorer out. It may still rebuild a lost prediction and fill the cache, because both keep
-        what was paid for."""
+        `write=False` writes no results, though it may still rebuild a prediction or fill the cache."""
         files, brought = run.prediction_files(), run.brought()
         if brought and not files & {f"{r.id}.json" for r in rows}:
             raise ValueError(f"none of the {errors.counted(len(files), 'file')} in {run.predictions} "
@@ -316,8 +213,7 @@ class Scorer[R: data.Row, G, P]:
         lines: list[Line] = []
         _discard(home)
         try:
-            # Note: we go `batch_size` rows at a time so that no more than one batch's predictions, golds and
-            # details are in memory at once. Each batch's details are written before the next batch is read.
+            # Note: one batch's predictions, golds and details in memory at a time.
             n = self.batch_size or len(rows) or 1
             for at in range(0, len(rows), n):
                 chunk = rows[at:at + n]
@@ -343,8 +239,7 @@ class Scorer[R: data.Row, G, P]:
                  for x in lines]
         ys = [{k: v for k, v in x.items() if k != "status"} for x in lines if x["status"] == "scored"]
         summary = self._framed(self.summarize(ys) if ys else None, lines, run.name)
-        # Note: counts and a few ids, not every id: a run stopped early would print thousands. Each of them is a
-        # failed line in scores.jsonl ("no prediction: ..." or "not scored: ...").
+        # Note: counts and a few ids, not every id, which a run stopped early would have thousands of.
         if missing or unscored:
             summary["partial"] = {"no_answer": len(missing), "not_scored": len(unscored),
                                   "e.g.": [*missing, *unscored][:SHOWN]}
@@ -352,27 +247,27 @@ class Scorer[R: data.Row, G, P]:
         else: _discard(home)
         return summary
 
-    def _read(self, run: runs.Run, rows: Sequence[R]) -> tuple[dict[str, Score], list[tuple[R, P, G]]]:
-        """Reads some rows. Returns the scores of the rows that failed (the call failed, or the prediction is
-        missing or can't be read), and the other rows with their predictions and golds, ready to score."""
-        failed: dict[str, Score] = {}
+    def _read(self, run: runs.Run, rows: Sequence[R]) -> tuple[dict[str, _Failed], list[tuple[R, P, G]]]:
+        """The rows that failed (by their record, a missing or unreadable prediction, or `prediction`), and the
+        others with their predictions and golds, ready to score."""
+        failed: dict[str, _Failed] = {}
         ready: list[tuple[R, P, G]] = []
         for r in rows:
             if err := (run.record(r.id) or {}).get("error"):
-                failed[r.id] = Score._failed(f"{err['type']}: {err['message']}")
+                failed[r.id] = _Failed(f"{err['type']}: {err['message']}")
                 continue
             try:
                 output = run.prediction(r.id)
             except FileNotFoundError:
-                failed[r.id] = Score._failed(f"no prediction: predictions/{r.id}.json")
+                failed[r.id] = _Failed(f"no prediction: predictions/{r.id}.json")
                 continue
             except ValueError as exc:   # Note: the core's own check that the file is JSON
-                failed[r.id] = Score._failed(str(exc))
+                failed[r.id] = _Failed(str(exc))
                 continue
             try:
                 pred = self.prediction(output)
             except errors.SystemFailed as exc:
-                failed[r.id] = Score._failed(str(exc), "".join(traceback.format_exception(exc)))
+                failed[r.id] = _Failed(str(exc), "".join(traceback.format_exception(exc)))
                 continue
             except Exception as exc:
                 errors.noted(exc, type(self), f"reading the prediction of {r.id}")
@@ -380,9 +275,8 @@ class Scorer[R: data.Row, G, P]:
             ready.append((r, pred, self._gold(r)))
         return failed, ready
 
-    def _scored(self, ready: Sequence[tuple[R, P, G]]) -> dict[str, Score]:
-        """`score_all` of the rows ready to score, by id. Checks that it gave one `Score` per row. A bug in the
-        scorer stops grading, raised as it is with a note naming the scorer."""
+    def _scored(self, ready: Sequence[tuple[R, P, G]]) -> dict[str, Score | errors.Unscored]:
+        """`score_all` of the rows ready to score, by id, checked."""
         if not ready: return {}
         rows, preds, golds = (list(xs) for xs in zip(*ready, strict=True))
         try:
@@ -392,24 +286,18 @@ class Scorer[R: data.Row, G, P]:
             what = f"scoring {row}" if row else f"scoring {errors.counted(len(rows), 'row')} from {rows[0].id}"
             errors.noted(exc, type(self), what)
             raise
-        if len(got) != len(rows) or not all(isinstance(x, Score) for x in got):
-            raise TypeError(f"{type(self).__name__}.score_all must return one scorer.Score per row: {len(rows)} "
-                            f"rows, got {len(got)} values")
-        # Note: a scorer scores a row or leaves it unscored; only the core fails a row (from its record, a missing
-        # prediction, or `prediction` raising SystemFailed), so that one rule decides every 0.
+        # Note: a scorer can't fail a row (only `_Failed`, from the core, does), so the one rule decides every 0.
+        if len(got) != len(rows) or not all(isinstance(x, (Score, errors.Unscored)) for x in got):
+            raise TypeError(f"{type(self).__name__}.score_all must return, for each of its {len(rows)} rows, a "
+                            f"scorer.Score, or an errors.Unscored for a row it couldn't score; got {len(got)} values: "
+                            f"{sorted({type(x).__name__ for x in got})}")
         for r, x in zip(rows, got, strict=True):
-            if x.result.get("status", "unscored") != "unscored":
-                raise ValueError(f"{type(self).__name__} gave row {r.id} the status {x.result['status']!r}; a scorer "
-                                 "can only score a row or leave it unscored (Score.unscored). To fail a row for an "
-                                 "output it can't use, raise errors.SystemFailed in prediction()")
+            if isinstance(x, Score): _check_score(type(self).__name__, r.id, x)
         return {r.id: x for r, x in zip(rows, got, strict=True)}
 
     def _keys(self, ready: Sequence[tuple[R, P, G]], code: str) -> dict[str, str]:
-        """Each ready row's cache key: a digest of its prediction, its gold, the scorer's options and the code.
-
-        A gold that isn't JSON is refused: it is the scorer's own choice, and would never be cached. A prediction
-        that isn't (a NaN a system answered) is the system's: that row gets no key, so it is scored every time
-        and never cached."""
+        """Each ready row's cache key: a digest of its prediction, gold, the scorer's options and code. A gold that
+        isn't JSON is refused; a prediction that isn't gets no key, so it is scored every time."""
         out = {}
         for r, p, g in ready:
             rest = [g, self.options(), code]
@@ -420,24 +308,33 @@ class Scorer[R: data.Row, G, P]:
                 log.info("%s: the prediction of %s isn't plain JSON; it is scored but not cached", self.name, r.id)
         return out
 
-    def _as_json(self, x: Score) -> Score:
-        """A score converted to JSON and back, so that a fresh score and a kept one hold the same values."""
-        if x.result.get("status", "scored") != "scored": return x
+    def _as_json(self, x: Score | errors.Unscored) -> Score | errors.Unscored:
+        """A score converted to JSON and back, so a fresh score and a kept one hold the same values."""
+        if not isinstance(x, Score): return x
         _digest(self, "its results", [x.result, x.details])
         return Score(*json.loads(json.dumps([x.result, x.details])))
 
-    def _line(self, r: R, x: Score) -> Line:
-        """A row's line: what the row is (id, status, row fields), then its score's numbers. A failed or unscored
-        row's result holds its own status (`Score._failed`, `Score.unscored`)."""
-        if clash := sorted(set(x.result) & {"id", "row"}):
-            raise TypeError(f"{self.name}'s result for row {r.id} holds {clash}, which a line keeps for the row; "
-                            "name them otherwise")
-        return {"id": r.id, "status": "scored", **({"row": f} if (f := self.row_fields(r)) else {}), **x.result}
+    def _line(self, r: R, x: Score | errors.Unscored | _Failed) -> Line:
+        """A row's line: what the row is (id, status, row fields), then its score's numbers, or why it has none."""
+        row = {"row": f} if (f := self.row_fields(r)) else {}
+        errors.plain(f, f"{self.name}.row_fields for row {r.id}")
+        match x:
+            case Score():
+                if clash := sorted(set(x.result) & {"id", "status", "row"}):
+                    raise ValueError(f"{self.name}'s result for row {r.id} holds {clash}, which its line keeps for "
+                                     "the core; name them otherwise")
+                return {"id": r.id, "status": "scored", **row, **x.result}
+            case errors.Unscored():
+                return {"id": r.id, "status": "unscored", **row, "error": errors.capped(str(x))}
+            case _Failed():
+                return {"id": r.id, "status": "failed", **row, "error": errors.capped(x.error),
+                        **({"traceback": errors.capped(x.traceback)} if x.traceback else {})}
+            case _:
+                raise AssertionError(x)
 
     def _framed(self, summary: Summary | None, lines: Sequence[Line], run: str) -> Summary:
-        """The summary of a grading: what every summary holds, and `summarize`'s summary under `scored`, with the
-        headline rule applied. The headline is `scored`'s headline times coverage, so a failed row counts as 0;
-        when no row was scored, `scored` is None and the headline is 0."""
+        """The grading's summary: the core's fields, and `summarize`'s summary under `scored`. The headline is
+        `scored`'s times coverage, or 0 when no row was scored (`scored` is None)."""
         cover = coverage(lines)
         if summary is not None: _check_summary(type(self).__name__, summary)
         return {"scorer": self.name, "options": self.options(), "run": run,
@@ -446,14 +343,9 @@ class Scorer[R: data.Row, G, P]:
                 "failed": sum(x["status"] == "failed" for x in lines), "coverage": cover, "scored": summary}
 
     def _code(self) -> str:
-        """A digest of the code the scorer and its judges run: their classes' names, and every Python file of the
-        packages their classes come from, or the file a class is defined in when it is in no package. A change
-        to how it scores (a prompt, a parser, a rule, or a helper in another module of its package) changes
-        every row's cache key.
-
-        It reads whole packages, not only the classes, because a scorer often hands the comparison to helper
-        modules, and a fix there must not leave stale scores behind. A change elsewhere in the package only
-        costs a rescoring."""
+        """A digest of the code the scorer and its judges run: their classes' names and every Python file of
+        their packages (or a class's own file when it is in none), so a fix in a helper module invalidates the
+        cache too."""
         cls = [c for c in type(self).__mro__ if issubclass(c, Scorer) and c is not Scorer]
         cls += [c for f in dataclasses.fields(self) if isinstance(v := getattr(self, f.name), adapter.Adapter)
                 for c in type(v).__mro__ if issubclass(c, adapter.Adapter) and c is not adapter.Adapter]
@@ -503,8 +395,7 @@ def _unfinished(run: runs.Run, missing: Sequence[str], unscored: Sequence[tuple[
 
 
 def _kept(home: Path, keys: dict[str, str]) -> dict[str, Score]:
-    """The kept scores in `<home>/cache/` whose key still matches the row's. A missing or unreadable one is
-    left out, so that row is scored again."""
+    """The kept scores in `<home>/cache/` whose key still matches; a missing or unreadable one is left out."""
     out = {}
     for i, k in keys.items():
         try:
@@ -515,26 +406,25 @@ def _kept(home: Path, keys: dict[str, str]) -> dict[str, Score]:
     return out
 
 
-def _keep(home: Path, keys: dict[str, str], scores: dict[str, Score]) -> None:
+def _keep(home: Path, keys: dict[str, str], scores: dict[str, Score | errors.Unscored]) -> None:
     """Writes each scored row's score to `<home>/cache/`, with its key."""
     for i, x in scores.items():
-        if x.result.get("status", "scored") != "scored" or i not in keys: continue
+        if not isinstance(x, Score) or i not in keys: continue
         (home / "cache").mkdir(parents=True, exist_ok=True)
         runs.write_json(home / "cache" / f"{i}.json", {"key": keys[i], "result": x.result, "details": x.details})
 
 
-def _write_details(home: Path, scores: Sequence[tuple[str, Score]]) -> None:
-    """Writes each row's details to `<home>/.details.partial/`. `_write` moves them into place when grading
-    finishes."""
+def _write_details(home: Path, scores: Sequence[tuple[str, Any]]) -> None:
+    """Writes each scored row's details to `<home>/.details.partial/`, which `_write` moves into place."""
     for i, x in scores:
-        if x.details is None: continue
+        if not isinstance(x, Score) or x.details is None: continue
         (home / ".details.partial").mkdir(parents=True, exist_ok=True)
         runs.write_lines(home / ".details.partial" / f"{i}.jsonl", x.details)
 
 
 def _write(home: Path, lines: Sequence[Line], summary: Summary) -> None:
-    """Moves the details written during grading into place, then writes the lines, then the summary. The
-    summary is last, so it always stands beside the lines it summarizes."""
+    """Moves the details into place, then writes the lines, then the summary, last, so it always stands beside
+    the lines it summarizes."""
     home.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(home / "details", ignore_errors=True)
     if (home / ".details.partial").is_dir(): (home / ".details.partial").rename(home / "details")
@@ -547,13 +437,12 @@ def _discard(home: Path) -> None:
     shutil.rmtree(home / ".details.partial", ignore_errors=True)
 
 
-def _score_one(s: Scorer, id: str, pred: Any, gold: Any) -> Score:
-    """`s.score` of one row. A row it can't score is unscored, and anything else it raises is a bug. It is at
-    the top of the module so a process pool can send it to another process."""
+def _score_one(s: Scorer, id: str, pred: Any, gold: Any) -> Score | errors.Unscored:
+    """`s.score` of one row, or its `errors.Unscored`. At module level so a process pool can send it."""
     try:
         got = s.score(pred, gold)
     except errors.Unscored as exc:
-        return Score.unscored(str(exc))
+        return exc
     except Exception as exc:
         exc.row = id   # Note: kept on the exception, which a process pool sends back whole, to name the row
         raise
@@ -562,9 +451,20 @@ def _score_one(s: Scorer, id: str, pred: Any, gold: Any) -> Score:
     return got
 
 
+def _check_score(name: str, id: str, x: Score) -> None:
+    """Refuses a `Score` whose `result` isn't a dict, or whose `details` isn't None or a list of dicts."""
+    if not isinstance(x.result, dict):
+        raise TypeError(f"{name} scored row {id} with a result that is a {type(x.result).__name__}; a result is a "
+                        "dict of the row's values, e.g. {\"exact\": True}")
+    if x.details is not None and not (isinstance(x.details, list) and all(isinstance(d, dict) for d in x.details)):
+        raise TypeError(f"{name} scored row {id} with details that aren't a list of dicts; give a list of dicts, "
+                        "one per thing checked, or None")
+    errors.plain(x.result, f"{name}'s result for row {id}")
+    errors.plain(x.details, f"{name}'s details for row {id}")
+
+
 def _digest(s: Scorer, what: str, x: Any) -> str:
-    """A digest of `x`, which must be JSON. Anything else has no written form that is the same in every
-    process."""
+    """A digest of `x`, which must be JSON, the one form that is the same in every process."""
     try:
         return hashlib.sha256(json.dumps(x, sort_keys=True, allow_nan=False).encode()).hexdigest()
     except (TypeError, ValueError) as exc:
@@ -573,11 +473,8 @@ def _digest(s: Scorer, what: str, x: Any) -> str:
 
 
 def ask[I](judge: adapter.Adapter[I], x: I, *, timeout: float = 300.0) -> dict[str, Any]:
-    """Asks `judge` about `x`, and returns the judge's record, which holds its answer.
-
-    The call follows the same rules as a system's calls (`adapter.predict`): a time budget, retries, and a
-    stop on an account failure. Raises `errors.Unscored` when the judge didn't answer, so the row is left
-    for a later grading rather than failed."""
+    """Asks `judge` about `x` under a system's rules (`adapter.predict`), and returns its record. Raises
+    `errors.Unscored` when the judge didn't answer, so the row waits for a later grading."""
     rec = adapter.predict(judge, x, timeout=timeout)
     if (e := rec["error"]) is not None:
         raise errors.Unscored(f"the judge {judge.name} didn't answer: {e['type']}: {e['message']}")
@@ -585,13 +482,15 @@ def ask[I](judge: adapter.Adapter[I], x: I, *, timeout: float = 300.0) -> dict[s
 
 
 def coverage(lines: Sequence[Line]) -> float:
-    """The share of rows that were scored rather than failed. Unscored rows count as neither."""
+    """The share of rows scored rather than failed; unscored rows count as neither."""
     n = sum(x["status"] in ("scored", "failed") for x in lines)
     return sum(x["status"] == "scored" for x in lines) / n if n else 0.0
 
 
 def _check_summary(name: str, s: Any) -> None:
-    """Refuses a summary without a `headline` from 0 to 1 and a `headline_is`, before anything is written."""
+    """Refuses a summary without a `headline` from 0 to 1 and a `headline_is`, or that isn't plain JSON, before
+    anything is written."""
+    errors.plain(s, f"{name}.summarize's summary")
     if not isinstance(s, dict) or "headline" not in s:
         raise ValueError(f'{name}.summarize must return a dict with a "headline" key, the number runs are compared '
                          f"by; it returned {s!r:.120}")

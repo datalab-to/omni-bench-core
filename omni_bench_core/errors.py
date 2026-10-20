@@ -1,65 +1,53 @@
-"""The two exceptions the core acts on, and the one rule that decides what an exception does:
+"""The exceptions the core acts on, and helpers for messages.
 
-    A row counts 0 only when code says, on purpose, that the system failed, by raising `SystemFailed`.
-    Any other exception stops the run and is raised as it is.
+The one rule: a row counts 0 only when code raises `SystemFailed` on purpose. Any other exception stops the run
+and is raised as it is. So:
 
-So:
+- `SystemFailed` (and its kinds `SystemTimeout`, `SystemUnreachable` and `Unreadable`): the system failed on one
+  row, which is recorded and counts 0;
+- `Unscored`: a scorer couldn't score one row (a judge that didn't answer), which waits for a later grading; and
+- anything else is a native exception (`ValueError` for wrong input, `PermissionError` for an account that
+  can't pay, and so on), raised as it is, with a note from `noted` saying which class and which row.
 
-- `SystemFailed` (and its kinds `SystemTimeout`, `SystemUnreachable`, `Unreadable`): the system failed on
-  one row. The row's record keeps it, with its traceback, and the row counts 0; the run goes on. A transient
-  one (a 429, a 5xx) is retried first;
-- `Unscored`: a scorer couldn't score one row for a reason that isn't the system's (a judge that didn't
-  answer). Grading isn't finished until a later grading scores it; and
-- anything else is a native exception, raised as it is with its own traceback: a `ValueError` for what was
-  asked wrong (an option, a dataset, a missing key, a run graded before it is finished), a `PermissionError`
-  for an account that can't pay, an `ImportError` for a missing package, a refused connection as the
-  connection error it is, and a bug in an adapter or a scorer as whatever it raised. The core adds a note
-  saying where (`noted`): which class, and which row.
-
-A stop of any kind keeps every answer that was paid for, so running the same command again after the fix
-costs nothing for the rows already done.
-
-This module also has helpers: `counted` writes a count in a message, `capped` cuts a message written to a
-file, `check_dataclass` refuses an adapter, scorer or task that forgot its dataclass decorator, `package` says
-which installed package a class comes from, and `noted` adds where an exception was raised.
+Helpers: `capped`, `counted`, `check_dataclass`, `plain`, `package`, `refused` and `noted`.
 """
 
 from __future__ import annotations
 
 import functools
+import json
 from typing import Any
 
-# Note: we decide whether a retry can help from the HTTP status, not from the message text. Two spellings
-# of the same condition once drifted apart, and 91 predictions were never retried while 18 identical ones
-# were.
+# Note: whether a retry can help is decided from the HTTP status, never from the message, whose wording drifts.
 TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
 CAP = 4000   # the most characters of a message or traceback written to a file
 
 
 class Unscored(Exception):
-    """A scorer couldn't score a row, for a reason that isn't the system's fault, such as a judge that
-    didn't answer.
+    """A scorer couldn't score a row this time, and asking again may give a score: the judge timed out, was
+    rate-limited, or was down. `scorer.ask` raises it once the judge's call has used up its retries.
 
-    The row counts as neither scored nor failed, so grading isn't finished until a later grading scores it."""
+    Raise it from `Scorer.score`, or return it in the row's place from `Scorer.score_all`. The row counts as
+    neither scored nor failed, so grading refuses to report until a later grading scores it. Don't use it for
+    what asking again won't change, or the run never finishes:
+
+    - a prediction the scorer can't use: raise `SystemFailed` in `Scorer.prediction`, and the row counts 0;
+    - a gold the scorer can't read: let it raise, and grading stops and names the row; and
+    - a bug: let it raise."""
 
 
 class SystemFailed(RuntimeError):
-    """The system failed on this row: raise it, on purpose, to record the row's failure, which counts 0.
+    """The system failed on this row. It is the only exception that counts a row as 0.
 
-    It is the only exception that counts a row as 0. Raise it in `Adapter.call` for a refusal, an error
-    status, or an answer you can see is unusable; in `Adapter.read` for an answer that can't be read; and in
-    `Scorer.prediction` for an output a scorer can't use. `adapter.reading` raises it for you. The row's
-    record keeps its message and traceback, so it is always clear which line decided the system failed.
+    Raise it in `Adapter.call` (a refusal, an error status), in `Adapter.read` (an answer that can't be read)
+    or in `Scorer.prediction` (an output the scorer can't use); `adapter.reading` raises it for you. The row's
+    record keeps its message and traceback. It carries what the record keeps about the call:
 
-    It carries what the row's record should keep about the failed call:
-
-    - `status`: the HTTP status, when there was one. It alone decides whether asking again is worth it;
+    - `status`: the HTTP status, if any. It alone decides whether a retry may help (`transient`);
     - `body`: what the system sent back;
-    - `sent`: what was sent besides the input, as in `Call.sent`, so the record says what was asked; and
-    - `cost`: what the failed call cost, an `adapter.Cost`, when the system charged for it. It is added to
-      the run's cost, so failures that were paid for are counted; and
-    - `job_id`: the system's id for the job, when it made one, so a job that failed or outlived its call
-      can be found and asked about."""
+    - `sent`: what was sent besides the input, as in `Call.sent`;
+    - `cost`: what the failed call cost, an `adapter.Cost`, added to the run's cost; and
+    - `job_id`: the system's id for the job, if it made one."""
 
     def __init__(self, message: str, *, status: int | None = None, body: str | None = None, sent: Any = None,
                  cost: Any = None, job_id: str | None = None):
@@ -72,15 +60,13 @@ class SystemFailed(RuntimeError):
 
     @property
     def transient(self) -> bool:
-        """Whether asking again may get an answer: a rate limit or a server fault is, a refusal is not."""
+        """Whether a retry may help: a rate limit or a server fault, not a refusal."""
         return self.status in TRANSIENT_STATUSES
 
 
 class SystemTimeout(SystemFailed):
-    """The row's time ran out while the system was still working.
-
-    It is not retried within the same call, because a retry would spend a second budget on a row we know
-    takes longer than one. A later run with `retry_failed` tries it again."""
+    """The row's time ran out. Not retried in the same run, since a retry would need a second budget; a later
+    run with `retry_failed` tries it again."""
 
     @property
     def transient(self) -> bool:
@@ -88,10 +74,8 @@ class SystemTimeout(SystemFailed):
 
 
 class SystemUnreachable(SystemFailed):
-    """The system couldn't be reached, or its answer never came back.
-
-    It is not retried within the same call. A failed poll can leave the job running at the system, and
-    asking again from the start would pay for it twice. A later run with `retry_failed` tries it again."""
+    """The system couldn't be reached, or its answer never came back. Not retried in the same run, since the job
+    may still be running and a new call would pay for it twice; a later run with `retry_failed` tries it again."""
 
     @property
     def transient(self) -> bool:
@@ -99,8 +83,8 @@ class SystemUnreachable(SystemFailed):
 
 
 class Unreadable(SystemFailed):
-    """The system answered, but its answer can't be read: `Adapter.read` raised `SystemFailed`. The raw answer
-    is kept in the record, so a fix to `read` reads it again without a new call (`Benchmark.reread`)."""
+    """The system answered, but `Adapter.read` raised `SystemFailed` on its answer. The raw answer is kept, so a
+    fix to `read` reads it again with no call (`Benchmark.reread`)."""
 
     @property
     def transient(self) -> bool:
@@ -108,9 +92,8 @@ class Unreadable(SystemFailed):
 
 
 def capped(text: str) -> str:
-    """`text`, cut to `CAP` characters when it is written to a file (a record, a line of scores.jsonl). It is the
-    one place a message is cut: a vendor's error can quote a whole web page, which the record keeps in `raw`
-    anyway, and a message is never cut where it is raised."""
+    """`text` cut to `CAP` characters, for writing to a file (a record, a line of scores.jsonl). Messages are cut
+    only here, never where they are raised."""
     return text if len(text) <= CAP else text[:CAP] + f"... ({len(text) - CAP} more characters)"
 
 
@@ -120,12 +103,8 @@ def counted(n: int, noun: str) -> str:
 
 
 def check_dataclass(cls: type, base: type) -> None:
-    """Refuses a class that declares fields but is not a dataclass.
-
-    Adapters, scorers and tasks are frozen dataclasses because their fields are their options. An adapter's
-    options are written to its run and are part of its run folder's name. A subclass that forgets
-    `@dataclasses.dataclass(frozen=True)` still runs, but its fields are not options. They are not written
-    down, and changing one changes the answers without changing the run's name."""
+    """Refuses a subclass of `base` that declares fields but isn't a dataclass. Its fields would not be options,
+    so changing one would change the answers without changing the run's folder."""
     import dataclasses
     import inspect
 
@@ -145,8 +124,8 @@ def check_dataclass(cls: type, base: type) -> None:
 
 @functools.cache
 def package(cls: type) -> tuple[str, str, str | None] | None:
-    """The installed package `cls` comes from: its name, its version, and its GitHub page when it names one.
-    None for a class in no installed package, such as one defined in a script or a notebook."""
+    """The installed package `cls` comes from: its name, version and GitHub page (if it names one). None for a
+    class in no installed package, such as one in a script."""
     import importlib.metadata as md
 
     for dist in md.packages_distributions().get(cls.__module__.split(".")[0], []):
@@ -157,9 +136,7 @@ def package(cls: type) -> tuple[str, str, str | None] | None:
 
 
 def refused(exc: BaseException) -> bool:
-    """Whether `exc`, or an exception it was raised from, is a refused connection: nothing listens at the
-    address. That is the same for every row, so it stops the run, rather than failing each row or passing for
-    a bug in the adapter."""
+    """Whether `exc`, or an exception in its chain, is a refused connection: nothing listens at the address."""
     import errno
 
     # Note: by type, never by message: a vendor's own error text can say "connection refused" about its servers.
@@ -171,7 +148,19 @@ def refused(exc: BaseException) -> bool:
 
 
 def noted[E: BaseException](exc: E, cls: type, what: str) -> E:
-    """`exc`, to be raised again as it is, with a note: which class's code raised it, and while doing `what`
-    ("reading the answer of doc_17")."""
+    """`exc` with a note saying which class raised it and while doing `what` ("predicting doc_17")."""
     exc.add_note(f"{cls.__name__} raised this while {what}")
     return exc
+
+
+def plain(x: Any, what: str) -> None:
+    """Refuses `x` unless it is plain JSON, naming `what` it is.
+
+    Everything the core writes or digests is plain JSON: dicts, lists, strings, finite numbers, booleans and None.
+    Anything else would be written as its `str()` and read back as a string, and an option's `str()` (an object's
+    address) would name a new run folder every time."""
+    try:
+        json.dumps(x, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{what} isn't plain JSON: {exc}. Give dicts, lists, strings, finite numbers, booleans and "
+                        "None (None for a number that has no value)") from None

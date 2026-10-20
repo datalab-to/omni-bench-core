@@ -9,6 +9,7 @@ the two are equal, with one detail line per differing character.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import functools
 import json
 import logging
@@ -782,6 +783,9 @@ def test_a_missing_key_is_refused_before_any_call(tmp: Path) -> None:
     else:
         raise AssertionError("a missing key was not refused")
     assert CALLS == [] and not (tmp / "runs").exists()
+    (tmp / "a.txt").write_text("hello")
+    refused(adapter.predict, Keyed(), tmp / "a.txt", match="keyed needs OMNI_BENCH_TEST_KEY")   # called directly too
+    assert CALLS == []
 
 
 def test_a_bug_stops_the_run_and_prints_its_traceback(tmp: Path) -> None:
@@ -814,6 +818,36 @@ class NoSummary(scorer.Scorer):
 
 
 @dataclasses.dataclass(frozen=True)
+class NoScore(scorer.Scorer):
+    def gold(self, row):
+        return None
+
+    def summarize(self, lines):
+        return {"headline": 1.0, "headline_is": "n"}
+
+
+@dataclasses.dataclass(frozen=True)
+class BadResult(Exact):
+    def score(self, pred, gold):
+        return scorer.Score([pred == gold])
+
+
+@dataclasses.dataclass(frozen=True)
+class BadDetails(Exact):
+    def score(self, pred, gold):
+        return scorer.Score({"exact": pred == gold, "length": 1}, "a diff")
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchJudge(Exact):
+    """Scores rows together, and couldn't score b1: it returns that row's Unscored rather than raising it."""
+
+    def score_all(self, rows, preds, golds):
+        return [errors.Unscored("the batch judge skipped it") if r.id == "b1" else self.score(p, g)
+                for r, p, g in zip(rows, preds, golds, strict=True)]
+
+
+@dataclasses.dataclass(frozen=True)
 class Headline(Exact):
     value: Any = 2.0
     what: Any = "exact"
@@ -837,18 +871,62 @@ class Status(Exact):
 
 
 def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(tmp: Path) -> None:
-    refused(bench, dataset(tmp / "d"), NoSummary(), match="NoSummary has no summarize")
+    refused(NoSummary, match="abstract method 'summarize'")             # Python refuses it: summarize is abstract
+    refused(bench, dataset(tmp / "d"), NoScore(), match="NoScore has neither score")
     for value, what, match in ((2.0, "exact", '"headline": 2.0'), (-0.1, "exact", '"headline": -0.1'),
                                (True, "exact", '"headline": True'), (None, "exact", '"headline": None'),
                                (0.5, "", '"headline_is" key')):
         refused(bench(tmp / "d", Headline(value, what)).run, GoldEcho(), tmp / f"runs-{value}-{what}", match=match)
     refused(bench(tmp / "d", NoHeadline()).run, GoldEcho(), tmp / "runs-nohead", match='a "headline" key')
-    for status in ("ok", "failed"):     # a scorer scores a row or leaves it unscored; only the core fails one
-        refused(bench(tmp / "d", Status(status)).run, GoldEcho(), tmp / f"runs-{status}",
-                match="can only score a row or leave it unscored")
+    for status in ("ok", "failed"):     # a result can't say its own status: only the core fails a row
+        refused(bench(tmp / "d", Status(status)).run, GoldEcho(), tmp / f"runs-{status}", match="holds ['status']")
+    for bad in (BadResult(), BadDetails()):    # what a Score holds is checked as each row is scored
+        refused(bench(tmp / "d", bad).run, GoldEcho(), tmp / f"runs-{bad.name}", match=f"{type(bad).__name__} scored row")
+    msg = refused(bench(tmp / "d", BatchJudge()).run, GoldEcho(), tmp / "runs-batch", match="1 row not scored")
+    assert "the batch judge skipped it" in msg and "b1" in msg, msg
     every = dataset(tmp / "refused", {"r1": ("", "refuse 1"), "r2": ("", "refuse 2")})
     s = bench(every).run(Copy(), tmp / "runs-none")["scorers"]["exact"]
     assert s["scored"] is None and s["headline"] == 0.0 and s["failed"] == 2, s   # summarize is never called
+
+
+@dataclasses.dataclass(frozen=True)
+class WithClient(Copy):
+    client: Any = dataclasses.field(default_factory=object)    # an object, not plain data
+
+
+@dataclasses.dataclass(frozen=True)
+class ReadsAnObject(Copy):
+    def read(self, raw: Any, x: Path) -> Any:
+        return {"text": raw["answer"], "at": datetime.datetime(2026, 1, 1)} if raw["answer"] == "world" \
+            else super().read(raw, x)
+
+
+@dataclasses.dataclass(frozen=True)
+class NanScore(Exact):
+    def score(self, pred, gold):
+        return scorer.Score({"exact": pred == gold, "length": float("nan")})
+
+
+@dataclasses.dataclass(frozen=True)
+class ObjectSummary(Exact):
+    def summarize(self, lines):
+        return {**super().summarize(lines), "when": datetime.date(2026, 1, 1)}
+
+
+def test_everything_written_is_plain_json(tmp: Path) -> None:
+    b = bench(dataset(tmp / "d", {k: v for k, v in TEXTS.items() if k != "c1"}))
+    refused(b.plan, WithClient(), tmp / "runs", match="WithClient's options isn't plain JSON")
+    try:
+        b.run(ReadsAnObject(), tmp / "runs", workers=1)
+    except TypeError as exc:       # a bug in read: raised, and the paid answer kept unread
+        assert "ReadsAnObject.read's output isn't plain JSON" in str(exc), exc
+    else:
+        raise AssertionError("an output that isn't plain JSON was written")
+    [folder] = (tmp / "runs").iterdir()
+    assert json.loads((folder / "records" / "a2.json").read_text())["unread"]
+    name = b.run(GoldEcho(), tmp / "runs")["run"]
+    refused(bench(tmp / "d", NanScore()).grade, tmp / "runs" / name, match="NanScore's result for row a1 isn't plain")
+    refused(bench(tmp / "d", ObjectSummary()).grade, tmp / "runs" / name, match="summarize's summary isn't plain JSON")
 
 
 if __name__ == "__main__":

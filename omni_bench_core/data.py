@@ -1,23 +1,15 @@
-"""Datasets: how they are found, downloaded and read.
+"""Datasets: how they are found, downloaded and read, and how rows are chosen.
 
-A dataset is a folder. It can also be a HuggingFace dataset, which is downloaded whole the first time it is
-used. Either way, it holds three things:
+A dataset is a folder, or `hf://datasets/<org>/<name>[@<revision>]`, downloaded whole on first use. It holds:
 
     manifest.parquet       one row per thing to predict: its id, its input files and its gold file
-    <any folder>/<file>    the input files, with any names; several rows may share one
+    <any folder>/<file>    the input files; several rows may share one
     <any folder>/<id>.json each row's gold, named after its row
 
-A task says which columns its rows have, and turns each row into its own frozen dataclass. This module
-checks only what every task needs:
-
-- each id is a file name, and no two ids are the same ignoring case, because an id names the row's files
-  (`predictions/<id>.json`) and some disks ignore case;
-- each path is relative and inside the dataset, so the dataset can be moved as one folder. A gold file is
-  named `<id>.json`, so a gold can't be graded against another row; and
-- every other column is kept, unread, in the row's `extra`, so a dataset can carry more for scorers of
-  its own.
-
-Everywhere in this package, `dataset` is either a folder's path or `hf://datasets/<org>/<name>[@<revision>]`.
+- `Row`: what the core reads of a row (its `id`);
+- `read_manifest`: a manifest's rows, checked;
+- `download_dataset`, `dataset_id`, `commit` and `manifest_path`: where a dataset is and what it is; and
+- `selection` and `select`: a choice of rows (`only`, `sample`, `limit`).
 """
 
 from __future__ import annotations
@@ -40,9 +32,8 @@ DOWNLOAD_ATTEMPTS = 5
 
 
 class Row(Protocol):
-    """What the shared code reads of a row: its `id`, which names the row's files (its prediction, record and
-    gold), so an answer is never graded against another row's gold. The task's own row type holds everything
-    else, and a scorer reads what it needs of it through `Scorer.row_fields`."""
+    """What the core reads of a row: its `id`, which names the row's prediction, record and gold. The task's row
+    type holds everything else; a scorer reads what it needs through `Scorer.row_fields`."""
 
     @property
     def id(self) -> str: ...
@@ -66,12 +57,8 @@ def hf_dataset(dataset: str | Path) -> tuple[str, str | None] | None:
 
 @functools.cache
 def download_dataset(dataset: str | Path) -> Path:
-    """The dataset as a folder on disk.
-
-    A folder is returned as it is. A HuggingFace dataset is downloaded whole, at one commit, into the
-    HuggingFace cache, even when only a few rows are run: a run's folder and its grading need the whole
-    dataset. A later run finds it there and downloads nothing, and a second call in the same process doesn't
-    even ask the Hub: planning, predicting and grading all need the folder."""
+    """The dataset as a folder on disk. An `hf://` dataset is downloaded whole, at one commit, into the
+    HuggingFace cache, even when only a few rows are run; a later run finds it there."""
     if (at := hf_dataset(dataset)) is None:
         root = Path(dataset).expanduser()
         if not root.is_dir():
@@ -89,9 +76,8 @@ def download_dataset(dataset: str | Path) -> Path:
         log.info("downloading %s, all of it, once; later runs use the copy in the HuggingFace cache. Tip: set "
                  "HF_TOKEN (or run `hf auth login`) to download faster and avoid the Hub's rate limits", dataset)
 
-    # Note: we try again because a dataset is hundreds of files, the Hub drops some requests under that load,
-    # and a new attempt resumes where the last one stopped. A missing repo or missing access fails at once,
-    # because it would fail the same way every time.
+    # Note: the Hub drops some of a dataset's hundreds of requests, and a new attempt resumes where the last
+    # stopped; a missing repo or missing access would fail the same way every time, so it fails at once.
     try:
         for attempt in range(DOWNLOAD_ATTEMPTS):
             try:
@@ -117,7 +103,7 @@ def download_dataset(dataset: str | Path) -> Path:
 
 
 def hub() -> Any:
-    """The `huggingface_hub` module, which reading an `hf://` dataset needs."""
+    """The `huggingface_hub` module, which an `hf://` dataset needs."""
     try:
         import huggingface_hub
     except ImportError as exc:
@@ -128,7 +114,7 @@ def hub() -> Any:
 
 
 def _cached(repo: str, revision: str | None) -> bool:
-    """Whether the dataset is already in the HuggingFace cache, asking nothing of the Hub."""
+    """Whether the dataset is in the HuggingFace cache, asking nothing of the Hub."""
     try:
         hub().snapshot_download(repo, repo_type="dataset", revision=revision, local_files_only=True)
     except Exception:  # noqa: BLE001 -- any reason it isn't there means it isn't cached
@@ -137,21 +123,19 @@ def _cached(repo: str, revision: str | None) -> bool:
 
 
 def dataset_id(dataset: str | Path) -> str:
-    """Which dataset this is, ignoring its revision: the repo of an `hf://` dataset, or a folder's full path.
-    A run folder records it, to refuse being used with another dataset."""
+    """Which dataset this is, ignoring its revision: an `hf://` repo, or a folder's full path."""
     if (at := hf_dataset(dataset)) is not None:
         return f"{HF_PREFIX}{at[0]}"
     return str(Path(dataset).expanduser().resolve())
 
 
 def commit(dataset: str | Path, root: Path) -> str | None:
-    """The commit an `hf://` dataset was read at, which is the name of its downloaded folder. None for a
-    folder, which has no commits."""
+    """The commit an `hf://` dataset was read at (its downloaded folder's name); None for a folder."""
     return root.name if hf_dataset(dataset) is not None else None
 
 
 def manifest_path(manifest: str) -> str:
-    """A manifest's path inside its dataset, always written the same way. Refuses a path outside the dataset."""
+    """A manifest's path inside its dataset, written one way. Refuses a path outside the dataset."""
     m = PurePosixPath(manifest)
     if m.is_absolute() or ".." in m.parts:
         raise ValueError(f"manifest {manifest} must be a path inside the dataset, relative to it, "
@@ -163,19 +147,18 @@ def manifest_path(manifest: str) -> str:
 def read_manifest(dataset: str | Path, manifest: str = MANIFEST, *, columns: tuple[str, ...],
                   id: str = "id", inputs: tuple[str, ...] = (), gold: str | None = "gt_path"
                   ) -> tuple[Path, tuple[dict[str, Any], ...]]:
-    """The dataset's folder, and its manifest's rows, checked, in the manifest's order.
-
-    It reads the manifest, then checks each row (`row`) and that no id appears twice (`unique`).
+    """The dataset's folder, and its manifest's rows, checked, in order. Each id must be a file name, unique
+    ignoring case; each path must be relative and inside the dataset; and a gold file must be `<id>.json`.
 
     Args:
-      columns: the columns every row must have, besides the ones named below.
+      columns: the columns every row must have, besides the ones below.
       id: the column holding each row's id.
-      inputs: the columns holding paths to input files. They become full paths on this machine.
-      gold: the column holding the path to each row's gold file. It becomes a full path on this machine.
+      inputs: the columns holding paths to input files, made full paths.
+      gold: the column holding the path to the row's gold file, made a full path.
 
     Returns:
-      The folder, and each row as a dict. The dict holds the row's id, `inputs`, `gold` and `columns`, and
-      `extra`, which holds every other column of the manifest, unread.
+      The folder, and each row as a dict of `id`, `inputs`, `gold` and `columns`, plus `extra`, every other
+      column, unread.
     """
     import pyarrow.parquet as pq
 
@@ -201,8 +184,7 @@ def read_manifest(dataset: str | Path, manifest: str = MANIFEST, *, columns: tup
 
 def row(r: dict[str, Any], n: int, path: Path, root: Path, need: tuple[str, ...], *, id: str,
         inputs: tuple[str, ...], gold: str | None) -> dict[str, Any]:
-    """Manifest row `n`, checked. Its paths become full paths under `root`, and its other columns go into
-    `extra`. `path` is the manifest's path, used only in messages."""
+    """Manifest row `n`, checked, with full paths and its other columns in `extra`. `path` is for messages."""
     i = r[id]
     if not isinstance(i, str) or not i or i in (".", "..") or Path(i).name != i:
         raise ValueError(f"{path}: row {n + 1} has {id} {i!r}, which is not a file name; it names the "
@@ -221,10 +203,7 @@ def row(r: dict[str, Any], n: int, path: Path, root: Path, need: tuple[str, ...]
 
 
 def unique(ids: Sequence[str], path: Path) -> None:
-    """Refuses an id that appears more than once, ignoring case.
-
-    An id names files, and on a disk that ignores case (macOS, Windows) two ids that differ only in case
-    would be one file."""
+    """Refuses an id that appears twice ignoring case, since on macOS and Windows the two would be one file."""
     by: dict[str, list[str]] = {}
     for i in ids: by.setdefault(i.casefold(), []).append(i)
     if twice := [xs for xs in by.values() if len(xs) > 1]:
@@ -233,9 +212,8 @@ def unique(ids: Sequence[str], path: Path) -> None:
 
 
 def selection(limit: int = 0, sample: int = 0, only: Iterable[str] | None = None) -> dict[str, Any]:
-    """A choice of rows, written the same way every time: only what was given, names sorted. It is part of
-    a run's question, so it names the run's folder, and grading reads it back to know which rows the run
-    answers. `{}` is every row."""
+    """A choice of rows, written one way (only what was given, names sorted), as a run's question records it.
+    `{}` is every row."""
     out: dict[str, Any] = {}
     if (o := _names(only, "only")) is not None: out["only"] = sorted(o)
     if sample: out["sample"] = sample
@@ -245,16 +223,13 @@ def selection(limit: int = 0, sample: int = 0, only: Iterable[str] | None = None
 
 def select[R: Row](rows: Sequence[R], limit: int = 0, sample: int = 0,
                    only: Iterable[str] | None = None) -> tuple[R, ...]:
-    """The rows to run, in their order. The filters apply in this order:
+    """The rows to run, in their order, filtered in this order:
 
-    1. `only`: only rows with these ids;
-    2. `sample`: this many rows, evenly spaced over the manifest; and
+    1. `only`: the rows with these ids;
+    2. `sample`: this many rows, evenly spaced over the manifest, so two systems get the same rows; and
     3. `limit`: the first this many rows.
 
-    `sample` takes rows evenly spaced in the manifest's order, so it sees the same rows each time: two systems
-    run with the same `sample` answer the same rows. A dataset whose manifest is grouped by kind (by language,
-    by source) gets a sample that reaches across them. `sample` and `limit` are two ways to say how many rows,
-    so only one may be given."""
+    `sample` and `limit` can't both be given."""
     only = _names(only, "only")
     for name, n in (("limit", limit), ("sample", sample)):
         if isinstance(n, bool) or not isinstance(n, int): raise TypeError(f"{name} is a whole number, not {n!r}")
@@ -283,8 +258,7 @@ def _names(xs: Iterable[str] | None, what: str) -> frozenset[str] | None:
 
 
 def _inside(path: Any, id: str | None = None) -> bool:
-    """Whether `path` is a relative path to a file inside the dataset. Given `id`, also whether it is named
-    `<id>.json`."""
+    """Whether `path` is a relative path to a file inside the dataset, named `<id>.json` when `id` is given."""
     if not isinstance(path, str) or not path.strip(): return False
     p = Path(path)
     return (not p.is_absolute() and ".." not in p.parts and bool(p.suffix)
@@ -292,15 +266,13 @@ def _inside(path: Any, id: str | None = None) -> bool:
 
 
 def _on_hub(dataset: str | Path, manifest: str) -> None:
-    """Refuses an `hf://` dataset that has no `manifest`, before downloading gigabytes of it.
-
-    The Hub answers a private dataset that this machine's token can't read as if it didn't exist, so a dataset
-    the Hub doesn't show is reported as that, not as a missing manifest. When the Hub doesn't answer, the
-    download goes ahead, and a manifest that really is missing is reported after it."""
+    """Refuses an `hf://` dataset with no `manifest` before downloading it. When the Hub doesn't answer, the
+    download goes ahead."""
     if (at := hf_dataset(dataset)) is None: return
     huggingface_hub = hub()
 
     try:
+        # Note: the Hub shows a private dataset this machine can't read as missing, so the message says both.
         if not huggingface_hub.repo_exists(at[0], repo_type="dataset"):
             raise ValueError(f"the Hugging Face Hub shows no dataset {at[0]}: it doesn't exist, or it is private "
                              "and this machine has no token that can read it (set HF_TOKEN)")

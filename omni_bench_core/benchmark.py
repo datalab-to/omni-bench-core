@@ -1,7 +1,8 @@
-"""Benchmarks: a task's dataset and the scorers that grade it, run on predictive systems.
+"""Benchmarks: a task, its dataset and the scorers that grade it.
 
-`Benchmark` is the class to use, and its docstring says how. `Plan` is what `Benchmark.plan` checks and
-`Benchmark.predict` carries out. `predict_row` is the work for one row, which an executor may run elsewhere.
+- `Benchmark`: plans, predicts, grades and checks;
+- `Plan`: one run, checked, before any call; and
+- `predict_row`: one row's work, which an executor may run elsewhere.
 """
 
 from __future__ import annotations
@@ -21,8 +22,7 @@ log = logging.getLogger(__name__)
 
 
 class Plan(NamedTuple):
-    """One run, before any call: the run, the question it answers, the rows it chooses, and how. `Benchmark.plan`
-    builds and checks it, so `predict` has nothing left to refuse."""
+    """One run before any call, built and checked by `Benchmark.plan`, so `predict` has nothing left to refuse."""
 
     run: runs.Run
     question: Mapping[str, Any]      # the dataset, manifest, task and choice of rows the run answers
@@ -34,46 +34,31 @@ class Plan(NamedTuple):
 
 @dataclasses.dataclass(frozen=True)
 class Benchmark:
-    """A task, its dataset and manifest, and the scorers that grade it.
+    """A task, its dataset and manifest, and the scorers that grade it: what stays fixed while systems change.
 
         oeb = benchmark.Benchmark(Extract(), "hf://datasets/datalab-to/omni_extract_bench", [FieldMatching()])
         oeb.run(Datalab(mode="accurate"), out="runs", sample=20)
-        oeb.grade("mine/")                  # a folder of your own predictions, predicting nothing
+        oeb.grade("mine/")                  # a folder of your own predictions
 
-    A benchmark is what stays fixed while systems change: one task, one dataset and manifest, and the
-    scorers. So every system run on it is graded on the same rows by the same rules, and runs of different
-    systems can be compared.
+    A run is one system on the benchmark. Predicting pays for each answer once and saves it; grading is free
+    and can be repeated. Three rules decide every case:
 
-    A run is one system on the benchmark: to compare systems, run each, with the same choice of rows. A run has
-    two steps. Predicting sends each row to the system and saves its answer. Grading compares each
-    saved answer with its gold, once per scorer. Predicting costs money and time, and grading is free, so
-    the two are separate: an answer is paid for once and graded as often as we like.
+    1. a run folder answers one exact question: the system and its options, the dataset, manifest and task,
+       and the choice of rows (`sample`, `limit`, `only`). Another question gets another folder, and the same
+       question resumes;
+    2. grading reports only a finished run (every row answered or failed, and scored); otherwise it refuses
+       and names the rows, and `partial=True` counts them 0; and
+    3. a row counts 0 only when code raises `SystemFailed`. Any other exception stops the run and is raised as
+       it is; the answers already paid for are kept.
 
-    Three rules say what happens in every case:
+    Methods:
 
-    1. a run folder answers one exact question: the system and its options, the dataset, the manifest, the
-       task and the choice of rows (`sample`, `limit`, `only`). Another question gets another
-       folder; the same question resumes the same one;
-    2. grading reports only a finished run, one where every row it chose has an answer or a recorded failure,
-       and a score. Otherwise it refuses, and names the rows and how to finish them; `partial=True` grades
-       anyway, counting them as failed; and
-    3. a failure that is the system's (a refusal, an error, an answer that can't be read, a timeout) is
-       recorded, and the row counts 0. A failure that is ours (a missing key, an account that can't pay, a
-       bug, an interrupt) stops the run with nothing recorded, so running the same command again does the
-       row. A bug is raised as it is, with a note naming the class and the row.
-
-    It has six methods:
-
-        plan      the run, checked before any call: the options, the keys, the rows, their input files and
-                  each scorer's gold
-        predict   sends every row the run has no record of to its system; a stopped run resumes
-        grade     each scorer on a finished run, over the rows the run answers
-        run       plan, then predict, then grade
-        reread    reads a run's saved answers again with its adapter's `read`, after a fix to it, with no call
-        check     checks the dataset (manifest, input files, golds) without calling anything
-
-    The dataset is a folder or an `hf://` address, never rows made in code, because a run folder records which
-    dataset its answers are for.
+        plan      the run, checked before any call (options, keys, rows, input files and golds);
+        predict   sends the rows the run has no record of; a stopped run resumes;
+        grade     each scorer on a finished run;
+        run       plan, then predict, then grade;
+        reread    reads a run's saved answers again after a fix to `read`, with no call; and
+        check     checks the dataset with no call.
     """
 
     task: task.Task
@@ -85,10 +70,11 @@ class Benchmark:
         errors.check_dataclass(type(self.task), task.Task)
         for s in self.scorers:
             errors.check_dataclass(type(s), scorer.Scorer)
-            # Note: refused here, before any call, rather than when grading finds it, after the answers are paid for.
-            if type(s).summarize is scorer.Scorer.summarize:
-                raise ValueError(f"{type(s).__name__} has no summarize: write one that returns the headline "
-                                 "(a number from 0 to 1, higher is better) and headline_is (what it is)")
+            # Note: `score` can't be abstract, since a scorer that scores rows together writes `score_all` instead;
+            # so a scorer with neither is refused here, before any call, not after the answers are paid for.
+            if type(s).score is scorer.Scorer.score and type(s).score_all is scorer.Scorer.score_all:
+                raise TypeError(f"{type(s).__name__} has neither score(pred, gold) nor score_all(rows, preds, golds); "
+                                "write score, or score_all to score rows together")
         if not self.scorers:
             raise ValueError("a benchmark needs at least one scorer")
         if len(names := [s.folder_name for s in self.scorers]) != len(set(names)):
@@ -100,8 +86,7 @@ class Benchmark:
         return self.task.rows(self.dataset, self.manifest)
 
     def question(self, selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """What a run on this benchmark answers, besides its system: the dataset, the manifest, the task and the
-        choice of rows (`data.selection`)."""
+        """What a run answers besides its system: the dataset, manifest, task and choice of rows."""
         return {"dataset": data.dataset_id(self.dataset), "manifest": data.manifest_path(self.manifest),
                 "task": self.task.identity(), "rows": dict(selection or {})}
 
@@ -111,11 +96,10 @@ class Benchmark:
         """The run of `system`, in its own folder under `out`, checked before any call.
 
         Args:
-          only, sample, limit: choose the rows (`data.select`). They are part of the run's question,
-            so another choice of rows is another run, and grading covers exactly these rows.
+          only, sample, limit: choose the rows (`data.select`); part of the run's question.
           timeout: the seconds each row may take.
-          workers: how many rows are in flight at once; 0 for the system's own `Adapter.workers`.
-          retry_failed: predict again the rows whose recorded failure might not happen again.
+          workers: rows in flight at once; 0 for the system's own `Adapter.workers`.
+          retry_failed: predict again the rows whose recorded failure may not recur.
         """
         if not isinstance(system, adapter.Adapter):
             raise TypeError(f"{system!r} is not one adapter instance; make one, e.g. Datalab(mode='accurate'). A run "
@@ -124,9 +108,7 @@ class Benchmark:
             raise ValueError(f"timeout is {timeout}; give the seconds a row may take, a positive number")
         if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
             raise ValueError(f"workers is {workers!r}; give a whole number, or 0 for the system's own")
-        if missing := system.missing_keys():
-            raise ValueError(f"{system.label} needs {', '.join(missing)}: "
-                             + " and ".join(f"export {k}=..." for k in missing) + ", then run again")
+        adapter.check_keys(system)
         every = self.rows()
         selection = data.selection(limit, sample, only)
         chosen = data.select(every, **selection)
@@ -139,18 +121,14 @@ class Benchmark:
                     workers or type(system).workers, retry_failed)
 
     def check(self) -> dict[str, int]:
-        """Checks the dataset before it is used or published, and returns how many rows it has.
-
-        It reads every row (`Task.rows` checks the manifest), builds every row's input (`Task.input`, which
-        raises when an input file is missing), and reads every gold (each scorer's `check_gold`). It makes no
-        call and runs no scorer."""
+        """Checks the dataset with no call: every row, input file and gold. Returns how many rows it has."""
         every = self.rows()
         self._inputs(every)
         for s in self.scorers: s.check_gold(every)
         return {"rows": len(every)}
 
     def describe(self, p: Plan) -> str:
-        """What `predict(p)` would do, without calling anything. Read it before paying for a run."""
+        """What `predict(p)` would do, without calling anything."""
         def said(v: Any) -> str:
             if not isinstance(v, list): return str(v)
             return ", ".join(v) if len(v) <= 3 else f"{len(v)} of them"
@@ -164,14 +142,12 @@ class Benchmark:
 
     def predict(self, p: Plan, executor: Callable[[int], cf.Executor] = cf.ThreadPoolExecutor) -> None:
         """Sends every row the run lacks to its system, `p.workers` at a time, and saves each answer as it arrives.
+        An exception (an account, a refused connection, a bug) or an interrupt stops the run once the calls in
+        flight are saved; the same command resumes.
 
-        A failure that is the same for every row (an account, a refused connection), or a bug, stops the run once
-        the calls in flight are saved. An interrupt does the same. Either way, running the same command again resumes.
-
-        `executor` makes the pool, given its number of workers: threads on this machine by default. Another
-        executor (processes, a cluster, a GPU container next to a model's server) runs `predict_row` for each
-        row wherever it likes; this machine still decides which rows are needed and saves every record. It is
-        also how several runs share one rate limit: give each run a factory that returns one shared pool."""
+        `executor` makes the pool from a number of workers: threads by default. Another executor (processes, a
+        cluster) runs `predict_row` elsewhere, while this machine chooses the rows and saves every record. A
+        factory returning one shared pool lets several runs share a rate limit."""
         r = p.run
         r.prepare(p.question, data.commit(self.dataset, data.download_dataset(self.dataset)), p.timeout)
         self._read_unread(r, p.rows)
@@ -182,8 +158,7 @@ class Benchmark:
             log.info("%s: %s", r.name, f"resuming: {done} of {errors.counted(len(p.rows), 'row')} done in an earlier "
                      f"run, {len(work)} to predict" if work else f"all {errors.counted(len(p.rows), 'row')} done in an "
                      "earlier run; nothing to predict")
-        with progress.Board() as board, executor(p.workers) as ex:
-            board.start(r.name, len(p.rows), len(work))
+        with progress.Board(r.name, len(work)) as board, executor(p.workers) as ex:
             try:
                 while True:
                     while work and len(live) < p.workers and failure is None:
@@ -201,12 +176,9 @@ class Benchmark:
 
     def grade(self, run: runs.Run | str | Path, *, partial: bool = False, details: bool = True,
               write: bool = True) -> dict[str, Any]:
-        """Grades `run`, or the folder of your own predictions at that path, with each scorer. Returns the run's
-        name, its cost and each scorer's summary by folder name.
-
-        A run is graded over the rows it answers (its settings.json's `rows`); a folder of your own, over the
-        whole manifest. Grading refuses a run that isn't finished (a `ValueError`); `partial=True` grades
-        it anyway, counting its unfinished rows as failed. `write=False` writes no results (`Scorer.grade`)."""
+        """Grades `run` (or a folder of your own predictions) with each scorer, over the rows it answers. Returns
+        the run's name, its cost and each scorer's summary by folder name. An unfinished run is refused with a
+        `ValueError`; `partial=True` counts its unfinished rows 0. `write=False` writes no results."""
         r = run if isinstance(run, runs.Run) else runs.Run.at(run)
         every = self.rows()
         if not r.brought(): r.check_settings(self.question())
@@ -226,19 +198,16 @@ class Benchmark:
 
     def run(self, system: adapter.Adapter, out: str | Path, *,
             executor: Callable[[int], cf.Executor] = cf.ThreadPoolExecutor, **kwargs: Any) -> dict[str, Any]:
-        """`plan`, then `predict` (with `executor`), then `grade`. `kwargs` are `plan`'s. Returns the grading. A
-        run that stops part way isn't graded: run the same command again to finish it."""
+        """`plan`, then `predict` (with `executor`), then `grade`; `kwargs` are `plan`'s. Returns the grading."""
         p = self.plan(system, out, **kwargs)
         log.info("%s", self.describe(p))
         self.predict(p, executor)
         return self.grade(p.run)
 
     def reread(self, run: runs.Run | str | Path, system: adapter.Adapter | None = None) -> list[str]:
-        """Reads every saved answer of `run` again with its system's `read`, with no call. Returns the ids
-        whose record changed. Use it after a fix to `read`: the raw answers were kept so that this is free.
-
-        `run` is a `Run` with its system, or a run folder's path with the `system` that made it (the same
-        adapter and options; settings.json says which). Grade the run again afterwards."""
+        """Reads every saved answer of `run` again with its system's `read`, with no call, after a fix to `read`.
+        Returns the ids whose record changed. `run` is a `Run` with its system, or a folder with the `system`
+        that made it. Grade it again afterwards."""
         if not isinstance(run, runs.Run): run = runs.Run(Path(run), system)
         elif system is not None: run = runs.Run(run.folder, system)
         if run.system is None:
@@ -259,9 +228,8 @@ class Benchmark:
         return changed
 
     def _read_unread(self, r: runs.Run, rows: Sequence[data.Row]) -> None:
-        """Reads again, with no call, every answer of `r` that a bug in `read` left unread, so running the same
-        command again after the fix picks up where it stopped. A `read` that still raises stops here, before any
-        call."""
+        """Reads again, with no call, every answer of `r` that a bug in `read` left unread. A `read` that still
+        raises stops here, before any call."""
         for x in rows:
             if not (rec := r.record(x.id)) or not rec.get("unread"): continue
             try:
@@ -271,7 +239,7 @@ class Benchmark:
                 raise
 
     def _inputs(self, rows: Sequence[data.Row]) -> None:
-        """Refuses rows whose input file is missing (`Task.input` raises), listing them all."""
+        """Refuses rows whose input file is missing."""
         missing = []
         for r in rows:
             try:
@@ -284,21 +252,15 @@ class Benchmark:
 
 
 def _headline(s: dict[str, Any]) -> str:
-    """A summary's headline as the log line shows it: the scorer's number over the scored rows, times coverage,
-    so a low headline reads as either poor answers or few of them."""
+    """A summary's headline as the log line shows it: the scorer's number over the scored rows times coverage."""
     if s["scored"] is None: return f"{s['headline']:.3f}: no row was scored"
     sc, n = s["scored"], errors.counted(s["rows"] - s["failed"], "scored row")
     return f"{s['headline']:.3f} = {sc['headline']:.3f} ({sc['headline_is']}) on {n} × coverage {s['coverage']:.3f}"
 
 
 def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: float) -> dict[str, Any]:
-    """One row's record, computed but not saved: its input, then `adapter.predict`.
-
-    This is what an executor runs, as `submit(predict_row, task, system, row, timeout)`. It takes only frozen
-    dataclasses, so an executor can send it to another process or machine. A row's paths are this machine's;
-    an executor that runs it elsewhere gives the row its own paths first. The machine running the benchmark
-    saves what it returns. A row whose input file disappeared after the plan checked it stops the run: it is
-    the dataset's problem, not the system's or the adapter's."""
+    """One row's record, computed but not saved: what an executor runs. It takes only frozen dataclasses, so it
+    can be sent to another process or machine, which gives the row its own paths first."""
     try:
         x = t.input(row)
     except FileNotFoundError as exc:
@@ -309,8 +271,8 @@ def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: f
 
 
 def _saved(r: runs.Run, x: data.Row, f: cf.Future, board: progress.Board) -> BaseException | None:
-    """Saves the record `f` holds for row `x` of run `r`, and returns None; or, when it raised, the failure to
-    stop the run with: a bug in the adapter is raised as it is, with a note naming the adapter and the row."""
+    """Saves the record `f` holds for row `x`, and returns None; or returns the exception it raised, noted, after
+    saving an answer that `read` couldn't read."""
     try:
         rec = f.result()
     except Exception as exc:
@@ -322,5 +284,5 @@ def _saved(r: runs.Run, x: data.Row, f: cf.Future, board: progress.Board) -> Bas
     except BaseException as exc:
         return exc
     r.save(x.id, rec)
-    board.saved(r.name, x.id, rec)
+    board.saved(x.id, rec)
     return None

@@ -1,27 +1,25 @@
-"""Adapters: how predictive systems are reached, and the rules every call follows.
+"""Adapters: how systems are reached, and the rules every call follows.
 
-`Adapter` is the class you subclass to add a system, and its docstring says how. The rest of the module:
-
+- `Adapter`: the class to subclass for a system;
 - `Call` and `Cost`: what `Adapter.call` returns;
-- `Budget` and `PollRetry`: helpers for a call that polls a job until it is done;
-- `predict`: sends one input to one adapter under the shared rules, and returns the row's record;
-- `record` and `reread`: build a record, and read a saved answer again;
-- `configure`: makes an adapter, or a scorer, from a config's options, checking them; and
-- `retryable`: says whether a recorded failure is worth trying again in a later run.
+- `Budget`, `PollRetry` and `reading`: helpers for writing `call` and `read`;
+- `predict`, `record` and `reread`: one row's call under the rules, and its record;
+- `configure`: an adapter or a scorer from a config's options, checked; and
+- `retryable`: whether a recorded failure may succeed in a later run.
 """
 
 from __future__ import annotations
 
+import abc
 import contextlib
 import dataclasses
 import difflib
-import json
 import os
 import re
 import time
 import typing
 from collections.abc import Iterator, Mapping, Sequence
-from typing import Any, ClassVar, NamedTuple
+from typing import Any, ClassVar, NamedTuple, final
 
 from omni_bench_core import errors
 
@@ -32,11 +30,8 @@ ACCOUNT_MARKERS = ("exceeded the maximum number of credits", "subscription has e
 
 
 class Cost(NamedTuple):
-    """What the system said a call cost. It is kept so that a comparison can weigh accuracy against price.
-
-    `usd` is None when the system doesn't say. `source` names the field of the response the figure was read
-    from, so it can be checked. Credits are never converted to dollars, because the rate depends on a
-    contract, not on the system."""
+    """What the system said a call cost. `usd` is None when it doesn't say, and `source` names the response field
+    the figure came from. Credits are never converted to dollars: the rate is a contract's, not the system's."""
 
     usd: float | None = None
     credits: float | None = None
@@ -46,7 +41,7 @@ class Cost(NamedTuple):
 
     @classmethod
     def total(cls, costs: Sequence[Cost]) -> Cost:
-        """Several calls' costs added up, field by field. A field is None when no call reported it."""
+        """Several calls' costs added up, field by field; None where no call reported one."""
         def add(f: str) -> Any:
             xs = [getattr(c, f) for c in costs if getattr(c, f) is not None]
             return round(sum(xs), 6) if xs else None
@@ -55,26 +50,20 @@ class Cost(NamedTuple):
 
     @classmethod
     def reported(cls, value: Any, source: str, *, cents: bool = False, **extra: Any) -> Cost:
-        """A cost the system stated, or an empty `Cost` when `value` is not a number.
-
-        It is the one place that decides what counts as a figure. This matters because `True` is an int in
-        Python, and a JSON `true` in a cost field is not a price. `cents=True` converts cents to dollars."""
+        """The cost the system stated, or an empty `Cost` when `value` isn't a number (a JSON `true` isn't a
+        price, though `True` is an int). `cents=True` converts cents to dollars."""
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             return cls(**extra)
         return cls(usd=round(float(value) / (100.0 if cents else 1.0), 6), source=source, **extra)
 
 
 class Call(NamedTuple):
-    """One row's answer as the system sent it, before any reading.
-
-    It is kept whole in the row's record. So after a fix to `read`, the answer is read again instead of
-    paid for again. It has four fields:
+    """One row's answer as the system sent it, kept whole in the row's record so a fix to `read` costs no call:
 
     - `raw`: the answer as received;
     - `cost`: what the system said it cost;
-    - `job_id`: the system's own id for the call, for asking the system about one row; and
-    - `sent`: what was sent besides the input (a schema as reshaped, a prompt), so the record says what
-      the system was actually asked."""
+    - `job_id`: the system's id for the call, if any; and
+    - `sent`: what was sent besides the input (a reshaped schema, a prompt)."""
 
     raw: Any
     cost: Cost = Cost()
@@ -83,10 +72,10 @@ class Call(NamedTuple):
 
 
 @dataclasses.dataclass(frozen=True)
-class Adapter[I]:
-    """One predictive system. An instance is one configuration of it.
+class Adapter[I](abc.ABC):
+    """One system. An instance is one configuration of it, such as `Datalab(mode="accurate")`.
 
-    The smallest adapter is a frozen dataclass with one method:
+    An adapter is a frozen dataclass with one abstract method:
 
         @dataclasses.dataclass(frozen=True)
         class Tesseract(adapter.Adapter):
@@ -95,37 +84,24 @@ class Adapter[I]:
             def call(self, page, *, timeout):
                 return adapter.Call(raw=subprocess.run([...], capture_output=True, text=True).stdout)
 
-    Its fields are the system's options, so an instance is one configuration, such as
-    `Datalab(mode="accurate")`. Every field is written to the run's settings.json and is part of its folder's
-    name (`run.folder_name`). So one folder holds one configuration, and a run always says what it asked.
+    Its fields are its options: they are written to the run's settings.json and digested into its folder's
+    name, so one folder holds one configuration. `call` gets the task's input, never the row (which holds the
+    gold), and is called from `workers` threads at once, so anything it shares must be thread-safe.
 
-    `call` is given the task's input (`Task.input`), which is what the system is sent. It is never given the
-    row, because the row holds the gold. It is called from `workers` threads at once, so anything it shares
-    across calls must be safe to use from several threads; a library that isn't (a PDF renderer, for one)
-    needs a lock around it.
+    Optional, with defaults:
 
-    Everything else is optional and has a default:
+        name             the name configs and run folders use; the class's name in snake case
+        read             the output in a raw answer; the raw answer itself
+        keys             the environment variables it needs, checked before any call; none
+        workers          rows in flight at once; 5
+        retries          further attempts after a transient failure, `backoff` seconds apart; 3
+        label            the run folder's name before the digest; `name`
+        account_failure  whether a failure is the account's (stops the run); 401, 402 or `ACCOUNT_MARKERS`
+        missing_keys     the `keys` not set; override when an option can stand in for a key
 
-        name      the name configs and run folders use; by default the class's name, in snake case
-        read      turns a raw answer into the output; by default the output is the raw answer
-        keys      the environment variables it needs, such as its API key; checked before a run starts,
-                  so a missing key stops nothing half way; none
-        workers   how many rows are in flight at once for this adapter; 5
-        retries   how many more attempts after a transient failure; 3, waiting `backoff` seconds between
-        label     the run folder's name before the digest; `name`
-
-    `account_failure(e)` decides whether a failure is the account's rather than the row's. By default it is
-    HTTP 401 or 402, or a known phrase (`ACCOUNT_MARKERS`) in the system's error. An adapter overrides it
-    when its system says so differently, or when one of those statuses can be about the row.
-
-    `options()` is what a run records and is named after. It is not overridden.
-
-    `predict` holds the rules every call follows, so no adapter writes them again: one time budget per row,
-    transient failures retried, a failure that is an answer recorded, and a failure that is the same for
-    every row (an account that can't pay, a refused connection) raised.
-
-    An adapter is called for one row at a time. To use a model that runs many rows at once, serve it, and
-    have its adapter call the server. The run and the server can share one machine.
+    `predict` applies the rules to every call, so no adapter writes them: one time budget per row, transient
+    failures retried, a `SystemFailed` recorded, and an account failure or refused connection raised. To run
+    many rows at once on one model, serve the model and have the adapter call the server.
     """
 
     name: ClassVar[str]
@@ -139,56 +115,44 @@ class Adapter[I]:
         if "name" not in cls.__dict__:
             cls.name = re.sub(r"(?<!^)(?=[A-Z])", "_", cls.__name__).lower()
 
+    @abc.abstractmethod
     def call(self, x: I, *, timeout: float) -> Call:
-        """Asks the system about one input, and returns its answer as received.
-
-        This is the one method every adapter writes, because how to reach a system is what differs between
-        systems. On a failure, raise `errors.SystemFailed` (or one of its kinds) rather than returning an
-        empty answer. That way the row is recorded as failed, not as a system that answered nothing.
-        `timeout` is the seconds left in the row's budget. A call that polls spends it with a `Budget`."""
-        raise NotImplementedError(f"{type(self).__name__} has no call(x, *, timeout) -> Call")
+        """Asks the system about one input, and returns its answer as received. Raise `errors.SystemFailed` on a
+        failure, never return an empty answer. `timeout` is the seconds left in the row's budget; a call that
+        polls spends it with a `Budget`."""
 
     def read(self, raw: Any, x: I) -> Any:
-        """The output in a raw answer. It is what predictions/<id>.json holds, and what every scorer reads.
-
-        It is separate from `call` because a bug in reading is cheap to fix and a call is not: the raw answer is
-        saved first. Raise `errors.SystemFailed` when the answer is unusable (an LLM's broken JSON): that row
-        counts 0. Anything else `read` raises is a bug: the run stops, the answer is kept, and running the same
-        command again after the fix reads it again with no call."""
+        """The output in a raw answer: what predictions/<id>.json holds and every scorer reads. Raise
+        `errors.SystemFailed` for an unusable answer (the row counts 0). Anything else is a bug: the run stops,
+        the answer is kept, and the same command after the fix reads it again with no call."""
         return raw
 
     @property
     def label(self) -> str:
-        """The run folder's name before the digest. It is `name`, unless one adapter stands for many systems
-        (one class for every model behind one API). Then the model should name the folder."""
+        """The run folder's name before the digest: `name`, or the model when one class stands for many models."""
         return self.name
 
     def account_failure(self, e: errors.SystemFailed) -> bool:
-        """Whether failure `e` is the account's: a key the system refuses (401), an account that can't pay
-        (402), or a known phrase saying so. Such a failure is the same for every row, so the run stops.
-
-        The phrases are looked for in the system's error only, never in a successful answer's body, which
-        can hold the document's own text."""
+        """Whether failure `e` is the account's: a refused key (401), an account that can't pay (402), or a known
+        phrase in the system's error (never in a successful body, which can hold the document's own text)."""
         body = (e.body or "") if (e.status or 0) >= 400 else ""
         return e.status in (401, 402) or any(m in f"{e} {body}".lower() for m in ACCOUNT_MARKERS)
 
     def missing_keys(self) -> list[str]:
-        """The variables of `keys` that aren't set. Override it when an option can stand in for a key, such as
-        an `api_key` option given in the config."""
+        """The variables of `keys` that aren't set."""
         return [k for k in self.keys if not os.environ.get(k)]
 
+    @final
     def options(self) -> dict[str, Any]:
-        """Every option of the adapter. This is what its run's settings.json and records say it was asked."""
+        """The adapter's options, as its run's settings.json and records state them."""
         errors.check_dataclass(type(self), Adapter)
-        return dataclasses.asdict(self)
+        out = dataclasses.asdict(self)
+        errors.plain(out, f"{type(self).__name__}'s options")
+        return out
 
 
 class Budget:
-    """One row's deadline, shared by every call, poll and retry made for that row.
-
-    Every system gets the same number of seconds per row, with uploading, polling and retrying all counted.
-    A setting of ours must never decide that one system answers more rows than another. It uses a monotonic
-    clock, because a wall clock can jump back."""
+    """One row's deadline, shared by every call, poll and retry for it, so every system gets the same time."""
 
     __slots__ = ("total", "_deadline")
 
@@ -205,15 +169,12 @@ class Budget:
     def check(self, what: str) -> None:
         """Raises `SystemTimeout` if the time is up. `what` says what was still being waited for."""
         if self.expired():
-            raise errors.SystemTimeout(f"timed out at the {self.total:.0f}s limit; {what}")
+            raise errors.SystemTimeout(f"timed out at the {self.total:g} s limit; {what}")
 
 
 class PollRetry:
-    """Keeps polling a job after a poll fails.
-
-    A failed poll is not a failed job: the job is still running, and is being paid for. If the failure were
-    raised out of `call`, the row would be retried from the upload, and the answer bought twice. A poll is
-    tried again only after a transient status, or after no status at all (the request never got that far)."""
+    """Keeps polling a job after a poll fails: the job may still be running, and a retry from the upload would
+    pay for it twice. A poll is tried again after a transient status, or no status at all, up to `limit` times."""
 
     __slots__ = ("budget", "limit", "count")
 
@@ -221,11 +182,11 @@ class PollRetry:
         self.budget, self.limit, self.count = budget, limit, 0
 
     def reset(self) -> None:
-        """Called after a poll succeeds, so the count of failures in a row starts again."""
+        """Call after a poll succeeds."""
         self.count = 0
 
     def again(self, status: int | None = None) -> bool:
-        """Called after a poll fails. Waits, within the budget, and returns whether to poll again."""
+        """Call after a poll fails: waits, within the budget, and returns whether to poll again."""
         if status is not None and status not in errors.TRANSIENT_STATUSES: return False
         self.count += 1
         if self.count > self.limit: return False
@@ -235,16 +196,12 @@ class PollRetry:
 
 @contextlib.contextmanager
 def reading(what: str) -> Iterator[None]:
-    """Says that a malformed answer read inside this block is the system's failure: a `ValueError`, `KeyError`,
-    `IndexError`, `TypeError` or `AttributeError` raised inside (a JSON array where an object was expected)
-    becomes a `SystemFailed` saying what couldn't be read, so the row counts 0 and the run goes on. The record
-    keeps the original exception's traceback, which shows whether the answer changed or the reading is wrong.
+    """Turns a `ValueError`, `KeyError`, `IndexError`, `TypeError` or `AttributeError` raised inside the block into a
+    `SystemFailed` saying what couldn't be read, so a malformed answer counts 0 instead of stopping the run:
 
         with adapter.reading("the job's status"):
             status = resp.json()["status"]
-
-    It is shorthand for raising `SystemFailed` yourself. Outside it, an exception in `call` or `read` is a bug,
-    and stops the run."""
+    """
     try:
         yield
     except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
@@ -253,14 +210,9 @@ def reading(what: str) -> Iterator[None]:
 
 
 def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
-    """An instance of `cls`, an adapter or a scorer, with `options` from a config, checked.
-
-    It checks three things:
-
-    - an unknown option is refused by name, because a typo that went through would run the defaults and
-      report them as what was asked;
-    - a whole number given for a float option becomes a float, so `0` and `0.0` name the same run; and
-    - a value of the wrong simple type is refused."""
+    """An instance of `cls`, an adapter or a scorer, with `options` from a config. An unknown option or a value of
+    the wrong simple type is refused, and a whole number for a float option becomes a float, so `0` and `0.0`
+    name the same run."""
     from . import scorer  # deferred: scorer imports this module
 
     options = dict(options or {})
@@ -275,10 +227,7 @@ def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
                          + f"; its options are: {', '.join(fields) or '(none)'}")
     hints = typing.get_type_hints(cls)
     for k, v in options.items():
-        try:
-            json.dumps(v, allow_nan=False, default=str)
-        except ValueError:
-            raise ValueError(f"{cls.name}: option {k} is {v!r}; give a finite number") from None
+        errors.plain(v, f"{cls.name}'s option {k} ({v!r})")
         t = hints.get(k)
         if t not in (str, int, float, bool): continue
         if t is float and isinstance(v, int) and not isinstance(v, bool):
@@ -288,24 +237,29 @@ def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
     return cls(**options)
 
 
+def check_keys(a: Adapter) -> None:
+    """Refuses `a` when an env var of its `keys` isn't set, before any call."""
+    if missing := a.missing_keys():
+        raise ValueError(f"{a.label} needs {', '.join(missing)}: " + " and ".join(f"export {k}=..." for k in missing)
+                         + ", then run again")
+
+
 def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
-    """Sends one input to `a`, and returns the row's record: its answer and the evidence for it.
+    """Sends one input to `a`, and returns the row's record. Exceptions follow the one rule:
 
-    What it does with an exception follows the one rule (`errors`):
+    - `SystemFailed` is recorded as the row's `error` and counts 0; a transient one (429, 5xx) is retried first,
+      within the row's budget, and an answer after the budget is a `SystemTimeout`;
+    - an account failure is raised as a `PermissionError`, and a refused connection as it is, with a note; and
+    - anything else is raised as it is. When `read` raised it, it carries the record as `unread`, so the paid
+      answer can be saved.
 
-    - `SystemFailed` is the row's answer: recorded as `error`, with its traceback, and counted 0. A transient
-      one (a 429, a 5xx) is retried first, up to `a.retries` times, within the row's budget. An answer that
-      arrives after the budget is a timeout, so every system gets the same time;
-    - a 401, a 402 or an account phrase (`Adapter.account_failure`) is raised as a `PermissionError`, and a
-      refused connection is raised as it is, with a note: they would be the same for every row; and
-    - anything else is raised as it is: a bug. When `read` raised it, the exception carries the record as
-      `unread`, so the paid answer is saved before the run stops.
+    A key of `a.keys` that isn't set is refused first (`check_keys`), as `Benchmark.plan` does.
 
-    The record holds `system`, `options`, `package` (the adapter's package and version, so answers from two
-    versions of an adapter can be told apart), `output` (None on a failure), `raw`, `sent`, `error` (its type,
-    status, whether it was transient, its message and its traceback), `cost` (with `wall_s` and `attempts`),
-    `job_id`, `timeout_s` and `captured_at`; and `unread` when `read` raised a bug.
+    The record holds `system`, `options`, `package` (the adapter's package and version), `output`, `raw`, `sent`,
+    `error` (type, status, transient, message and traceback), `cost` (with `wall_s` and `attempts`), `job_id`,
+    `timeout_s` and `captured_at`.
     """
+    check_keys(a)
     budget = Budget(timeout)
     started = time.time()
     got, error, attempts = None, None, 0
@@ -348,10 +302,8 @@ def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict
 
 def record(a: Adapter, got: Call | None, error: errors.SystemFailed | None, *, attempts: int, timeout: float,
            wall_s: float, at: str, spent: Sequence[Cost] = ()) -> dict[str, Any]:
-    """A row's record, built from what the calls returned: either the answer as received, or the failure.
-
-    Its cost is every attempt's cost added up: the failed attempts that were paid for (`spent`), and the
-    answer. Its `output` is filled in afterwards by `reread`, which `predict` calls when there is an answer."""
+    """A row's record from what the calls returned, the answer or the failure, with every paid attempt's cost.
+    `reread` fills in its `output`."""
     costs = [*spent, *([got.cost] if got is not None else [])]
     p = errors.package(type(a))
     rec = {"system": a.name, "options": a.options(), "package": f"{p[0]} {p[1]}" if p else None,
@@ -359,25 +311,28 @@ def record(a: Adapter, got: Call | None, error: errors.SystemFailed | None, *, a
            "cost": {**Cost.total(costs)._asdict(), "wall_s": wall_s, "attempts": attempts}, "job_id": None,
            "timeout_s": timeout, "captured_at": at}
     if got is not None:
+        errors.plain(got.raw, f"{type(a).__name__}.call's raw answer")
+        errors.plain(got.sent, f"{type(a).__name__}.call's sent")
         rec |= {"raw": got.raw, "sent": got.sent, "job_id": got.job_id}
     if error is not None:
         rec |= {"error": _failure(error)}
-        if got is None: rec |= {"raw": error.body, "sent": error.sent, "job_id": error.job_id}
+        if got is None:
+            errors.plain(error.sent, f"{type(a).__name__}'s SystemFailed sent")
+            rec |= {"raw": error.body, "sent": error.sent, "job_id": error.job_id}
     return rec
 
 
 def reread[I](a: Adapter[I], x: I, rec: dict[str, Any]) -> dict[str, Any]:
-    """`rec` with its output read again from its raw answer by `a.read`. A record whose call failed is returned
-    unchanged, because it has no answer to read.
-
-    `read` raising `SystemFailed` records the answer as `Unreadable`, which counts 0 and keeps the raw answer.
-    Anything else it raises is a bug in `read`: it is raised as it is, carrying as `unread` the record with the
-    raw answer and no output, so the answer is saved before the run stops."""
+    """`rec` with its output read again from its raw answer by `a.read`; unchanged when its call failed. `read`
+    raising `SystemFailed` records the answer as `Unreadable`. Anything else is raised as it is, carrying as
+    `unread` the record with no output, so the answer can be saved."""
     if rec["error"] is not None and rec["error"]["type"] != "Unreadable":
         return rec
     rec = {k: v for k, v in rec.items() if k != "unread"}
     try:
-        return rec | {"output": a.read(rec["raw"], x), "error": None}
+        output = a.read(rec["raw"], x)
+        errors.plain(output, f"{type(a).__name__}.read's output")
+        return rec | {"output": output, "error": None}
     except errors.SystemFailed as exc:
         e = errors.Unreadable(f"{type(exc).__name__}: {exc}" if type(exc) is not errors.SystemFailed else str(exc))
         e.__cause__ = exc
@@ -388,8 +343,7 @@ def reread[I](a: Adapter[I], x: I, rec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _failure(e: errors.SystemFailed) -> dict[str, Any]:
-    """A failure, as a record states it, with the traceback of where it was raised (and of what it was raised
-    from), so it is always clear which line decided the system failed."""
+    """A failure as a record states it, with the traceback of the line that raised it."""
     import traceback
 
     return {"type": type(e).__name__, "status": e.status, "transient": e.transient, "message": errors.capped(str(e)),
@@ -397,10 +351,8 @@ def _failure(e: errors.SystemFailed) -> dict[str, Any]:
 
 
 def retryable(error: Mapping[str, Any] | None) -> bool:
-    """Whether a recorded failure might succeed in a later run with `retry_failed`.
-
-    A timeout, an outage or a transient status might. A failure that is an answer (a 400, a refusal, an
-    answer that couldn't be read) won't."""
+    """Whether a recorded failure may succeed in a later run with `retry_failed`: a timeout, an outage or a
+    transient status may; a 400, a refusal or an unreadable answer won't."""
     if not error: return False
     return (error.get("type") in ("SystemTimeout", "SystemUnreachable")
             or error.get("status") in errors.TRANSIENT_STATUSES)

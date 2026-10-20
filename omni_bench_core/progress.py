@@ -4,34 +4,30 @@ from __future__ import annotations
 
 import logging
 import sys
-import threading
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 
 class Board:
-    """Every run being predicted, one line each: rows done, failed and still to go, and what they cost so far.
+    """One run being predicted: rows done, failed and still to go, and their cost so far.
 
-    On a terminal it is a table drawn live, redrawn as each answer arrives, with a line above it for each row
-    that failed. Anywhere else (a log file, CI, a pipe) a table can't be redrawn, so it writes one log line per
-    answer instead.
+    On a terminal it is a table redrawn as each answer is saved, with a line above it for each failed row.
+    Elsewhere (a log file, CI) it writes one log line per answer."""
 
-    Runs of different systems are predicted at once, from different threads, so every update takes a lock."""
-
-    def __init__(self, live: bool | None = None):
+    def __init__(self, run: str, todo: int, live: bool | None = None):
+        self.run, self.todo = run, todo
+        self.done, self.failed, self.usd = 0, 0, None
         self.live = sys.stderr.isatty() if live is None else live
-        self.lock = threading.Lock()
-        self.runs: dict[str, dict[str, Any]] = {}
         self._view: Any = None
         self._streams: list[tuple[logging.StreamHandler, Any]] = []
 
     def __enter__(self) -> Board:
+        # Note: no table when there is nothing to predict, so a finished run prints none.
+        if self.live and self.todo: self._show()
         return self
 
     def _show(self) -> None:
-        """Starts drawing the table, once a run has rows to predict: never an empty table, nor one with nothing
-        to show."""
         from rich.console import Console
         from rich.live import Live
 
@@ -51,30 +47,17 @@ class Board:
             self._view.update(self._table())
             self._view.__exit__(*exc)
 
-    def start(self, run: str, rows: int, todo: int) -> None:
-        """Adds a run: how many rows it answers, and how many of them still need a call."""
-        with self.lock:
-            self.runs[run] = {"rows": rows, "todo": todo, "done": 0, "failed": 0, "usd": None}
-            if self.live and self._view is None and todo: self._show()
-            self._redraw()
-
-    def saved(self, run: str, id: str, rec: dict[str, Any]) -> None:
+    def saved(self, id: str, rec: dict[str, Any]) -> None:
         """Counts one row's saved record."""
-        with self.lock:
-            r = self.runs[run]
-            r["done"] += 1
-            if rec["error"] is not None: r["failed"] += 1
-            if (usd := (rec.get("cost") or {}).get("usd")) is not None: r["usd"] = (r["usd"] or 0.0) + usd
-            self._redraw()
-            done, todo = r["done"], r["todo"]
+        self.done += 1
+        if rec["error"] is not None: self.failed += 1
+        if (usd := (rec.get("cost") or {}).get("usd")) is not None: self.usd = (self.usd or 0.0) + usd
+        if self._view is not None: self._view.update(self._table())
         if rec["error"] is not None:
             e = rec["error"]
-            log.info("%s: %s failed: %s: %s", run, id, e["type"], str(e["message"])[:160])
+            log.info("%s: %s failed: %s: %s", self.run, id, e["type"], str(e["message"])[:160])
         elif not self.live:
-            log.info("%s: %d/%d %s", run, done, todo, id)
-
-    def _redraw(self) -> None:
-        if self._view is not None: self._view.update(self._table())
+            log.info("%s: %d/%d %s", self.run, self.done, self.todo, id)
 
     def _table(self) -> Any:
         from rich.table import Table
@@ -82,7 +65,6 @@ class Board:
         t = Table(title="predicting", title_justify="left", box=None, pad_edge=False)
         for col in ("run", "done", "failed", "to go", "cost"):
             t.add_column(col, justify="left" if col == "run" else "right")
-        for name, r in self.runs.items():
-            t.add_row(name, f"{r['done']}/{r['todo']}", str(r["failed"]), str(r["todo"] - r["done"]),
-                      "—" if r["usd"] is None else f"${r['usd']:.2f}")
+        t.add_row(self.run, f"{self.done}/{self.todo}", str(self.failed), str(self.todo - self.done),
+                  "—" if self.usd is None else f"${self.usd:.2f}")
         return t

@@ -1,9 +1,8 @@
 # omni-bench-core
 
-The shared core of the omni benchmarks. Measuring a predictive system on documents is always the same
-loop: send each row of a dataset to the system, save its answer, and grade the answers against the gold.
-A task package (omni-parse-bench, omni-extract-bench, or your own) writes the parts that differ, and this
-package runs the loop.
+The shared core of the omni benchmarks. Measuring a system on documents is always one loop: send each row of a
+dataset to the system, save its answer, and grade the answers against the gold. A task package
+(omni-parse-bench, omni-extract-bench, or your own) writes the parts that differ, and this package runs the loop.
 
 ```python
 from omni_bench_core import benchmark
@@ -18,8 +17,8 @@ What you write, from least to most:
 | to | write |
 | --- | --- |
 | run a benchmark | `Benchmark(task, dataset, scorers).run(SomeAdapter(...), out)`, once per system |
-| add a system | an `Adapter`: a frozen dataclass of its options, and `call(input) -> Call` |
-| add a way of grading | a `Scorer`: a frozen dataclass, `gold(row)`, `score(pred, gold) -> Score` and `summarize(lines)`, which returns `headline` and `headline_is` |
+| add a system | an `Adapter`: a frozen dataclass of its options, and `call(input) -> Call` (or raise `SystemFailed`) |
+| add a way of grading | a `Scorer`: a frozen dataclass, `gold(row)`, `score(pred, gold) -> Score` (or raise `Unscored`) and `summarize(lines)`, which returns `headline` and `headline_is` |
 | add a task | a `Task`: `rows(dataset)` and `input(row)`, a row type, and its adapters and scorers |
 
 Where to read next:
@@ -32,5 +31,5 @@ Where to read next:
 Two limits are deliberate:
 
 - a dataset is a folder or an `hf://` address, never rows made in code, because a run folder records which
-  dataset its answers are for and refuses another; and
-- an adapter calls one row at a time. A model that batches is served, and its adapter calls the server.
+  dataset its answers are for; and
+- an adapter calls one row at a time; a model that batches is served, and its adapter calls the server.

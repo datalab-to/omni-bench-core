@@ -1,7 +1,7 @@
 # Overview
 
-This document is for someone who has never seen omni-bench-core. It goes through the pieces one at a time, with a
-small example for each, and then shows how they fit together.
+This document is for someone new to omni-bench-core. It goes through the pieces one at a time, with a small
+example for each, then the rules that hold across them.
 
 ## What a benchmark does
 
@@ -9,35 +9,41 @@ A benchmark measures a system, such as a parser, an extractor or an LLM, on a da
 same two things:
 
 1. send each row of the dataset to the system, and save what it answers; then
-2. compare each saved answer with that row's correct answer (the gold), and summarize the comparisons as
-   one number (the headline).
+2. compare each saved answer with that row's correct answer (the gold), which gives one score per row,
+   written to scores.jsonl; and summarize the scores as one number (the headline).
 
 ```
    1. predict                                       2. grade
 
-  +---------+  input   +--------+  answer   +------------+  answers   +--------+         +----------+
-  | dataset | -------> | system | --------> | run folder | ---------> | scorer | ------> | summary  |
-  |  rows   |          +--------+  saved    |  (on disk) |            +--------+         | headline |
-  +---------+                               +------------+                ^              +----------+
-       |                                                                  |
-       +------------------------------- gold -----------------------------+
+  +---------+  input   +--------+  answer   +------------+  answers   +--------+  a score   +--------------+
+  | dataset | -------> | system | --------> | run folder | ---------> | scorer | ---------> | scores.jsonl |
+  |  rows   |          +--------+  saved    |  (on disk) |            +--------+  per row   +--------------+
+  +---------+                               +------------+                ^                        |
+       |                                                                  |               Scorer.summarize
+       +------------------------------- gold -----------------------------+                        |
+                                                                                                   v
+                                                                                            +--------------+
+                                                                                            |   summary    |
+                                                                                            |   headline   |
+                                                                                            +--------------+
 ```
 
-Predicting costs money and time. Grading is cheap. So the two are separate steps, and predicting saves every
-answer to disk before anything is graded. You can grade again, with a new scorer or a fixed one, without
-calling the system again.
+Predicting costs money and time; grading is cheap. So predicting saves every answer to disk first, and you can
+grade again, with a new or fixed scorer, without calling the system.
 
 ## The pieces
 
-There are five pieces. Three of them you write, and two are given.
+There are five pieces. For three of them you choose an existing one (a benchmark package ships its task, its
+systems and its scorers) or subclass your own: `Task`, `Adapter` and `Scorer` are abstract base classes, and
+Python refuses an instance that's missing a required method. The other two you use as they are.
 
-| piece | what it is | you write it? |
+| piece | what it is | how you use it |
 | --- | --- | --- |
-| `Task` | what a row is, and what of a row a system is sent | yes, once per kind of task |
-| `Adapter` | how to call one system, and how to read its answer | yes, once per system |
-| `Scorer` | how to compare an answer with the gold | yes, once per way of grading |
-| `Run` | one system's folder of answers on disk | no |
-| `Benchmark` | a task, a dataset and its scorers, and the loop that runs them | no, you only make one |
+| `Task` | what a row is, and what of a row a system is sent | choose an existing one, or subclass your own |
+| `Adapter` | how to call one system, and how to read its answer | choose an existing one, or subclass your own |
+| `Scorer` | how to compare an answer with the gold | choose an existing one, or subclass your own |
+| `Run` | one system's folder of answers on disk | read it; the core makes it |
+| `Benchmark` | a task, a dataset and its scorers, and the loop that runs them | make one, `Benchmark(task, dataset, scorers)`; never subclass it |
 
 ```
   Benchmark(task, dataset, scorers)
@@ -50,12 +56,13 @@ There are five pieces. Three of them you write, and two are given.
   |    for each row:  Task.input(row) -> Adapter -> answer       |
   |                   saved in the Run                           |
   |                                                              |
-  |    for each scorer:  Scorer.grade(run) -> summary            |
+  |    for each scorer:  Scorer.grade(run) -> a score per row    |
+  |                      (scores.jsonl) -> summary               |
   +--------------------------------------------------------------+
 ```
 
-Each piece below has a small example from [`tests/test_core.py`](https://github.com/datalab-to/omni-bench-core/blob/main/tests/test_core.py). That file holds a whole toy task: the
-"system" is asked to copy a text file's text, and it is graded on whether the copy is exact.
+The examples below come from [`tests/test_core.py`](https://github.com/datalab-to/omni-bench-core/blob/main/tests/test_core.py),
+a whole toy task: the "system" copies a text file's text, and is graded on whether the copy is exact.
 
 ### The dataset and its rows
 
@@ -74,8 +81,8 @@ A dataset is a folder, or an `hf://` address of a Hugging Face dataset. It holds
     gold/a1.json              {"text": "hello"}
 ```
 
-A row is one line of the manifest, as a frozen dataclass. It holds paths, never file contents, so a large
-dataset fits in memory. It must have an `id`; everything else is the task's.
+A row is one line of the manifest, as a frozen dataclass holding paths, never file contents. It must have an
+`id`; everything else is the task's.
 
 ```python
 @dataclasses.dataclass(frozen=True)
@@ -90,17 +97,15 @@ class Doc:
         return self.doc_id
 ```
 
-A dataset can have more than one manifest, such as `manifests/sample40.parquet`, a subset of 40 rows that a
-dataset's authors chose.
+A dataset can have more than one manifest, such as `manifests/sample40.parquet`, a subset its authors chose.
 
 ### Task
 
-A task says what the rows are, and what a system is sent. It has two methods:
+A task says what the rows are, and what a system is sent. It has two abstract methods:
 
 - `rows(dataset)`: reads the manifest into rows; and
-- `input(row)`: the part of the row the system is sent, such as the PDF's path.
-
-`input` exists so that a system never sees the row, which holds the gold.
+- `input(row)`: the part of the row the system is sent, such as the PDF's path, so a system never sees the
+  gold.
 
 ```python
 @dataclasses.dataclass(frozen=True)
@@ -114,20 +119,15 @@ class Copying(task.Task):
 ```
 
 You write a task once per kind of task: omni-parse-bench has `Parse`, and omni-extract-bench has `Extract`.
-Most people only use one that exists.
 
 ### Adapter
 
-An adapter is how to call one system. It is a frozen dataclass, and its fields are the system's options,
-such as a mode or a model. One instance is one configuration of the system: `Datalab(mode="balanced")` and
-`Datalab(mode="accurate")` are two instances, and so two runs.
+An adapter is how to call one system. It is a frozen dataclass whose fields are the system's options, so one
+instance is one configuration: `Datalab(mode="balanced")` and `Datalab(mode="accurate")` are two runs. It has:
 
-It has two methods:
-
-- `call(input)`: calls the system and returns a `Call`, which holds the answer exactly as received (`raw`)
-  and what the system said it cost (`cost`). On a failure it raises a `SystemFailed`; and
-- `read(raw, input)`: turns the raw answer into the output the scorers read. The default returns `raw`
-  unchanged.
+- `call(input)`, abstract: calls the system and returns a `Call`, the answer as received (`raw`) and what
+  the system said it cost (`cost`), or raises `SystemFailed`; and
+- `read(raw, input)`: turns the raw answer into the output the scorers read; by default `raw` itself.
 
 ```python
 @dataclasses.dataclass(frozen=True)
@@ -143,10 +143,8 @@ class Copy(adapter.Adapter):
         return {"text": raw["answer"]}
 ```
 
-`call` and `read` are separate because the raw answer is saved. When you find a bug in `read`, you fix it and
-read every saved answer again (`Benchmark.reread`), without paying for new calls.
-
-You don't write retries, timeouts or error handling. The core wraps every call in the same rules:
+The raw answer is saved, so after a fix to `read`, `Benchmark.reread` reads every saved answer again with no
+call. You don't write retries, timeouts or error handling; the core wraps every call in the same rules:
 
 ```
   adapter.predict(system, input)
@@ -160,27 +158,20 @@ You don't write retries, timeouts or error handling. The core wraps every call i
       +-- any other exception     -> raised as it is, with a note naming the adapter and the row
 ```
 
-What your `call` and `read` raise decides which of these happens. One rule covers them: a row counts 0 only
-when you say the system failed.
+A row counts 0 only when you say the system failed:
 
-- `errors.SystemFailed(message, status=...)`, or one of its kinds (`SystemTimeout`, `SystemUnreachable`): the
-  system failed on this row. It is recorded with its traceback and counts 0, and a transient status is
-  retried first. Raise it in `read` for an answer you can't use (an LLM's broken JSON), or wrap the reading
-  in `with adapter.reading("..."):`, which raises it for you;
-- anything else stops the run, raised as it is, with its traceback and a note naming the adapter and the
-  row. Use a native exception with a message that says what to fix: a `ValueError` for a wrong option, say.
-  Declaring `keys` makes the core refuse a missing key (a `ValueError`) before any call, and a 401 or 402
-  becomes a `PermissionError`, so you rarely raise one for the account yourself. A bug in your adapter
-  stops the run the same way; if `read` raised it, the answer is kept, and is read again with no call when
-  you run the same command after the fix.
+- raise `errors.SystemFailed(message, status=...)` (or `SystemTimeout`, `SystemUnreachable`) in `call` or
+  `read`; or read the answer inside `with adapter.reading("..."):`, which raises it for you. It is recorded
+  with its traceback, and a transient status is retried first; and
+- anything else stops the run, raised as it is with a note naming the adapter and the row. Use a native
+  exception whose message says what to fix. Declare `keys`, and a missing key is refused before any call. If
+  `read` raised it, the answer is kept, and the same command after the fix reads it with no call.
 
 ### Run
 
-A run is one system's answers to one exact question, kept in a folder. You never write one, but you will
-read its files, so it helps to know what is in it.
-
-The question is everything that changes the answers: the system and its options, the dataset, the manifest,
-the task, and which rows (`sample`, `limit`, `only`). The folder's name is a digest of all of it:
+A run is one system's answers to one exact question, kept in a folder. The question is everything that changes
+the answers: the system and its options, the dataset, the manifest, the task, and which rows (`sample`, `limit`,
+`only`). The folder's name is a digest of it:
 
 ```
   runs/copy-1a2b3c4d/                 <system name>-<digest of the question>
@@ -194,28 +185,25 @@ the task, and which rows (`sample`, `limit`, `only`). The folder's name is a dig
       details/a1.jsonl                each row's breakdown, if the scorer gives one
 ```
 
-So asking another question uses another folder, and nothing gets mixed: `sample=20` and the full dataset
-are two runs, as are two configurations of one system. The rows are named by how they were chosen, so
-`sample=6` and `limit=6` are two runs even on a dataset where both pick the same rows. The timeout isn't
-part of the question: running again with a longer one (and `retry_failed`) gives the timed-out rows more time
-in the same folder, and each record keeps the timeout it had. Asking the same question again uses the same folder
-and resumes it: before calling the system for a row, the run checks whether that row already has a record,
-and skips it if so. No answer is paid for twice.
+Everything in a run folder is plain JSON: dicts, lists, strings, finite numbers, booleans and None. So an
+option, a raw answer, `read`'s output, a scorer's result and a summary must be plain JSON too, and the core
+refuses anything else (a `TypeError` naming what it was), rather than writing its `str()`.
+
+Another question uses another folder: `sample=20` and the full dataset are two runs, as are `sample=6` and
+`limit=6`. The same question resumes the same folder, skipping every row that already has a record, so no
+answer is paid for twice. The timeout isn't part of the question: running again with a longer one (and
+`retry_failed`) gives timed-out rows more time in the same folder.
 
 ### Scorer
 
-A scorer is one way of grading. It is a frozen dataclass, and its fields are its options. It has two methods
-you write:
+A scorer is one way of grading: a frozen dataclass whose fields are its options. You write:
 
-- `gold(row)`: reads the row's gold file and checks it. Each scorer reads its own, because what the gold
-  holds depends on the scorer; and
-- `score(pred, gold)`: compares one prediction with its gold, and returns a `Score`.
+- `gold(row)`, abstract: reads the row's gold and checks it;
+- `score(pred, gold)`: compares one prediction with its gold and returns a `Score` (or write `score_all`); and
+- `summarize(lines)`, abstract: the scored rows' lines as one summary.
 
-A `Score` has two parts:
-
-- `result`: a few numbers for the row, such as `{"exact": True, "length": 5}`; and
-- `details`: an optional breakdown, such as which characters differed. It is written to
-  `details/<id>.jsonl`, apart from the numbers, so it can be large.
+A `Score` holds `result`, a small dict of the row's values, mostly numbers (`{"exact": True, "length": 5}`),
+and optional `details`, a larger breakdown written to `details/<id>.jsonl`.
 
 ```python
 @dataclasses.dataclass(frozen=True)
@@ -249,29 +237,26 @@ Grading turns each row into one line of `scores.jsonl`, and all the lines into o
             "scored": {"headline": 0.5, "headline_is": "exact", "exact": 0.5}}
 ```
 
-A line is one row's grade, and scores.jsonl holds every row's. The core writes what the row is (`id`,
-`status`, and `row` when the scorer has `row_fields`), then the numbers `score` returned. A failed row's
-line holds its `error` instead. A scorer scores a row, or leaves it unscored (a judge that didn't answer:
-`errors.Unscored`, or `Score.unscored` from `score_all`); only the core fails a row, from its record, a missing
-prediction, or `prediction` raising `SystemFailed`. A result that gives itself any other status is refused.
+A line is one row's grade. The core writes `id`, `status` and `row` (from `row_fields`), then the row's
+numbers, or a failed row's `error`. A result may not use those three keys.
 
-The handoff is `summarize`. Every scorer writes it, because only the scorer knows how its rows combine (a
-mean, or one rate over every row's counts). It is given only the scored rows' lines, without their status,
-and returns `headline`, a number from 0 to 1 where higher is better, and `headline_is`, what the headline
-is; anything else in it is the scorer's own. The core keeps it under `scored`, and adds what it knows:
-`rows`, `failed`, `coverage`, and the top `headline`, `scored`'s headline times coverage, so a failed row
-counts as 0. When no row was scored, `summarize` isn't called, `scored` is null and the headline is 0. The
-core refuses a headline outside 0 to 1, because counting a failure as 0 only makes sense on that scale.
+The status comes from types, not from the scorer. A scorer returns a `Score`, or leaves a row unscored with
+`errors.Unscored` (a judge that didn't answer; raised from `score`, or returned in the row's place from
+`score_all`), which waits for a later grading. Use `Unscored` only when asking again may give a score (the judge
+timed out or was down); for anything asking again won't change, it would keep the run from ever finishing. Only
+the core fails a row: from its record, a missing prediction, or `prediction` raising `SystemFailed`.
 
-`Scorer.grade` runs those steps and applies the rules (below). You can't override it, so every scorer
-follows the same rules.
+`summarize` is the handoff. It gets only the scored rows' lines, without their status, and returns `headline`,
+a number from 0 to 1 where higher is better, and `headline_is`, what it is; anything else is the scorer's. The
+core keeps it under `scored` and adds `rows`, `failed`, `coverage`, and the top `headline`, `scored`'s times
+coverage, so a failed row counts as 0. When no row was scored, `summarize` isn't called and the headline is 0.
+A headline outside 0 to 1 is refused. `Scorer.grade`, which does all this, can't be overridden.
 
 ### How scoring runs
 
-`grade` reads the predictions and golds in batches of `batch_size` rows (500 by default), and hands each
-batch to `score_all`. By default, `score_all` calls `score` on each row of the batch, `workers` rows at a
-time, in a pool of processes or threads (`pool`). So you choose how scoring runs with three settings on the
-class, and you can take over completely by writing `score_all` yourself:
+`grade` reads predictions and golds in batches of `batch_size` rows (500 by default) and hands each batch to
+`score_all`, which by default calls `score` on each row, `workers` at a time, in a pool of processes or threads
+(`pool`). Writing `score_all` yourself takes over completely:
 
 ```
   Scorer.grade(run)
@@ -313,10 +298,9 @@ The three common cases:
           return scorer.Score({"agree": rec["output"]["verdict"] == "yes"})
   ```
 
-- Your own execution, such as one request per batch to a judge, a model on a GPU, or a cluster. Write
-  `score_all`. It gets a batch of values (never files) and returns one `Score` per row, in order.
-  `batch_size` sets how many rows a batch holds, and `None` gives it every row at once, for a score that
-  needs the whole run:
+- Your own execution, such as one request per batch to a judge, or a cluster. Write `score_all`: it gets a
+  batch of values (never files) and returns, in order, a `Score` per row or an `errors.Unscored` for a row it
+  couldn't score. `batch_size = None` gives it every row at once:
 
   ```python
   class BatchJudge(scorer.Scorer):
@@ -327,13 +311,12 @@ The three common cases:
           return [scorer.Score({"agree": v}) for v in verdicts]
   ```
 
-Whichever you choose, reading files, the cache, failures and the summary stay in `grade`. So the scorer
-only decides how to compute the scores.
+Whichever you choose, reading files, the cache, failures and the summary stay in `grade`.
 
 ### Benchmark
 
-A benchmark is a task, a dataset and its scorers: everything that stays fixed while the systems change. A
-run is one system on it; to compare systems, run each, with the same choice of rows.
+A benchmark is a task, a dataset and its scorers: what stays fixed while systems change. A run is one system on
+it; to compare systems, run each with the same choice of rows.
 
 ```python
 b = benchmark.Benchmark(Copying(), "my-dataset", [Exact()])
@@ -341,8 +324,7 @@ b.run(Copy(), out="runs")
 b.run(Copy(upper=True), out="runs")          # another configuration is another run, in its own folder
 ```
 
-`run` does three steps in order. Each step reads what the one before it wrote to disk, so you can also call
-them one at a time:
+`run` does three steps, each reading what the one before wrote to disk, so you can also call them one at a time:
 
 ```
   b.run(system, out)
@@ -367,18 +349,15 @@ Other things a benchmark does:
 
 ## The rules
 
-Three rules decide what happens in every case. They live in the parts you don't write, so a new adapter or
-scorer can't break them.
+Three rules decide every case. They live in the parts you don't write, so a new adapter or scorer can't break
+them:
 
-1. A run folder answers one exact question: the system and its options, the dataset, the manifest, the task
-   and which rows. Another question gets another folder; the same question resumes the same one.
-2. Grading reports only a finished run: every row it asked about has an answer or a recorded failure, and a
-   score. Otherwise grading refuses, names the rows, and says how to finish them. `partial=True` (`--partial`
-   on a command line) grades anyway and counts those rows as failed; the summary then says so, with how many
-   and a few of their ids.
-3. A row counts 0 only when code says, on purpose, that the system failed, by raising `errors.SystemFailed`.
-   Any other exception stops the run and is raised as it is. A stop keeps every answer that was paid for,
-   so running the same command again after the fix costs nothing for the rows already done.
+1. a run folder answers one exact question: the system and its options, the dataset, manifest and task, and
+   which rows. Another question gets another folder; the same question resumes;
+2. grading reports only a finished run: every row answered or failed, and scored. Otherwise it refuses and
+   names the rows; `partial=True` (`--partial`) counts them failed, and the summary says how many; and
+3. a row counts 0 only when code raises `errors.SystemFailed` on purpose. Any other exception stops the run and
+   is raised as it is; every answer already paid for is kept, so the same command after the fix resumes.
 
 What that means, case by case:
 
@@ -400,7 +379,7 @@ Two systems run with the same `sample` answer the same rows, so their headlines 
 
 ## When you need more
 
-Each of these is optional, has a default, and is described in its class's docstring.
+Each is optional, and described in its class's docstring.
 
 | you want | do this |
 | --- | --- |
