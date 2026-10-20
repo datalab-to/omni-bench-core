@@ -172,6 +172,10 @@ class Benchmark:
         work = collections.deque(x for x in p.rows if r.needs(x.id, p.retry_failed))
         live: dict[cf.Future, data.Row] = {}
         failure: BaseException | None = None
+        if done := len(p.rows) - len(work):
+            log.info("%s: %s", r.name, f"resuming: {done} of {errors.counted(len(p.rows), 'row')} done in an earlier "
+                     f"run, {len(work)} to predict" if work else f"all {errors.counted(len(p.rows), 'row')} done in an "
+                     "earlier run; nothing to predict")
         with progress.Board() as board, executor(p.workers) as ex:
             board.start(r.name, len(p.rows), len(work))
             try:

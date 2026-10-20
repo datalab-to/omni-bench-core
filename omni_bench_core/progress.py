@@ -27,20 +27,23 @@ class Board:
         self._streams: list[tuple[logging.StreamHandler, Any]] = []
 
     def __enter__(self) -> Board:
-        if self.live:
-            from rich.console import Console
-            from rich.live import Live
-
-            was = sys.stderr
-            self._view = Live(self._table(), console=Console(stderr=True), refresh_per_second=4, transient=False)
-            self._view.__enter__()
-            # Note: log handlers keep the stderr they were made with, so their lines would tear the table; while
-            # it is drawn they write to the stderr the table put in place, which prints them above it.
-            for h in logging.getLogger().handlers:
-                if isinstance(h, logging.StreamHandler) and h.stream in (sys.__stderr__, was):
-                    self._streams.append((h, h.stream))
-                    h.setStream(sys.stderr)
         return self
+
+    def _show(self) -> None:
+        """Starts drawing the table, once a run has rows to predict: never an empty table, nor one with nothing
+        to show."""
+        from rich.console import Console
+        from rich.live import Live
+
+        was = sys.stderr
+        self._view = Live(self._table(), console=Console(stderr=True), refresh_per_second=4, transient=False)
+        self._view.__enter__()
+        # Note: log handlers keep the stderr they were made with, so their lines would tear the table; while it
+        # is drawn they write to the stderr the table put in place, which prints them above it.
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and h.stream in (sys.__stderr__, was):
+                self._streams.append((h, h.stream))
+                h.setStream(sys.stderr)
 
     def __exit__(self, *exc: Any) -> None:
         if self._view is not None:
@@ -52,6 +55,7 @@ class Board:
         """Adds a run: how many rows it answers, and how many of them still need a call."""
         with self.lock:
             self.runs[run] = {"rows": rows, "todo": todo, "done": 0, "failed": 0, "usd": None}
+            if self.live and self._view is None and todo: self._show()
             self._redraw()
 
     def saved(self, run: str, id: str, rec: dict[str, Any]) -> None:

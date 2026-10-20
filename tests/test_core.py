@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
+import logging
 import shutil
 import tempfile
 import threading
@@ -194,8 +195,17 @@ def test_resume_calls_nothing(tmp: Path) -> None:
     b.run(Copy(), tmp / "runs")
     assert CALLS.count("f1") == 2, CALLS          # a 503 is retried within the row
     CALLS.clear()
-    g = b.run(Copy(), tmp / "runs")
+    said: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda r: said.append(r.getMessage())
+    logging.getLogger("omni_bench_core").addHandler(handler)
+    logging.getLogger("omni_bench_core").setLevel(logging.INFO)
+    try:
+        g = b.run(Copy(), tmp / "runs")
+    finally:
+        logging.getLogger("omni_bench_core").removeHandler(handler)
     assert CALLS == [], CALLS
+    assert any("all 6 rows done in an earlier run; nothing to predict" in m for m in said), said
     s = g["scorers"]["exact"]
     assert s["failed"] == 1 and abs(s["coverage"] - 5 / 6) < 1e-9
     assert abs(s["headline"] - 5 / 6) < 1e-9, s     # a refused row counts as 0
