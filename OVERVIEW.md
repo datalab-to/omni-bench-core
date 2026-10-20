@@ -362,7 +362,8 @@ scorer can't break them.
    and which rows. Another question gets another folder; the same question resumes the same one.
 2. Grading reports only a finished run: every row it asked about has an answer or a recorded failure, and a
    score. Otherwise grading refuses, names the rows, and says how to finish them. `partial=True` (`--partial`
-   on a command line) grades anyway and counts those rows as failed; the summary then says so, with their ids.
+   on a command line) grades anyway and counts those rows as failed; the summary then says so, with how many
+   and a few of their ids.
 3. A row counts 0 only when code says, on purpose, that the system failed, by raising `errors.SystemFailed`.
    Any other exception stops the run and prints its traceback. A stop keeps every answer that was paid for,
    so running the same command again after the fix costs nothing for the rows already done.
@@ -397,7 +398,7 @@ Each of these is optional, has a default, and is described in its class's docstr
 | to run several systems at once, sharing one rate limit | run each in its own thread or process; to share a limit, give each run an `executor` factory that returns one shared pool |
 | to run each row somewhere else (processes, a cluster) | `executor=` on `run`, a function that makes a `concurrent.futures.Executor` |
 | to try a scorer without writing results | `b.grade(run, write=False)` |
-| a number for a run you can't finish | `b.grade(run, partial=True)`: unfinished rows count 0, and the summary lists them |
+| a number for a run you can't finish | `b.grade(run, partial=True)`: unfinished rows count 0; the summary counts them and names a few, and scores.jsonl has each |
 
 ## Where to go next
 

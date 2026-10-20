@@ -154,7 +154,8 @@ class Scorer[R: data.Row, G, P]:
     - only a finished run is graded: every row has an answer or a recorded failure, and a score. A row with
       neither (never predicted, or no prediction in a folder of your own), or one the scorer couldn't score
       (a judge that didn't answer), makes grading refuse (`errors.Unfinished`), naming the rows and how to
-      finish them. `partial=True` grades anyway, counts those rows as failed, and says so in the summary;
+      finish them. `partial=True` grades anyway, counts those rows as failed, and says so in the summary
+      (`partial`: how many, and a few of their ids; scores.jsonl has each one);
     - a row with no usable answer fails and counts as 0 in the headline: `summarize` computes the headline over
       the scored rows, and `grade` multiplies it by `coverage`, the share of rows scored rather than failed,
       so failing on hard rows can't raise it. The summary's `headline_is` says so ("accuracy × coverage").
@@ -364,7 +365,11 @@ class Scorer[R: data.Row, G, P]:
         lines = [{**x, "status": "failed", "error": f"not scored: {x['error']}"} if x["status"] == "unscored" else x
                  for x in lines]
         summary = self._framed(self.summarize(lines), lines, run.name)
-        if missing or unscored: summary["partial"] = {"no_answer": missing, "not_scored": unscored}
+        # Note: counts and a few ids, not every id: a run stopped early would print thousands. Each of them is a
+        # failed line in scores.jsonl ("no prediction: ..." or "not scored: ...").
+        if missing or unscored:
+            summary["partial"] = {"no_answer": len(missing), "not_scored": len(unscored),
+                                  "e.g.": [*missing, *unscored][:SHOWN]}
         if write: _write(home, lines, summary)
         else: _discard(home)
         return summary

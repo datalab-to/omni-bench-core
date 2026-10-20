@@ -213,8 +213,8 @@ class Benchmark:
         cost = runs.total(r.costs(x.id for x in rows))
         spent = "" if cost["usd"] is None else f", cost ${cost['usd']:.2f}"
         for name, s in graded.items():
-            n = sum(map(len, s.get("partial", {}).values()))
-            part = f", PARTIAL: {n} unfinished rows counted 0" if n else ""
+            n = (p := s.get("partial", {})) and p["no_answer"] + p["not_scored"]
+            part = f", PARTIAL: {n} unfinished rows counted 0, each a failed line in scores.jsonl" if n else ""
             log.info("%s %s: headline %.3f (%s); %s, %d failed%s%s", r.name, name, s["headline"], s["headline_is"],
                      errors.counted(s["rows"], "row"), s["failed"], spent, part)
         return {"run": r.name, "cost": cost, "scorers": graded}

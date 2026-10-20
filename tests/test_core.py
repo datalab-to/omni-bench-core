@@ -284,7 +284,8 @@ def test_brought_predictions(tmp: Path) -> None:
         (mine / "predictions" / f"{i}.json").write_text(json.dumps({"text": TEXTS[i][1]}))
     refused(b.grade, mine, match="2 rows with no file in")
     s = b.grade(mine, partial=True)["scorers"]["exact"]
-    assert s["failed"] == 2 and abs(s["headline"] - 0.6) < 1e-9 and s["partial"]["no_answer"] == ["b2", "c1"], s
+    assert s["failed"] == 2 and abs(s["headline"] - 0.6) < 1e-9 and s["partial"] == {"no_answer": 2, "not_scored": 0,
+                                                                       "e.g.": ["b2", "c1"]}, s
     assert not (mine / "settings.json").exists()       # grading writes only its results into your folder
     stray = tmp / "stray"
     (stray / "predictions").mkdir(parents=True)
@@ -600,7 +601,7 @@ def test_a_stop_records_nothing_and_grades_nothing(tmp: Path) -> None:
     msg = refused(b.grade, folder, match="1 row never predicted, or answered but not yet read: z9")
     assert "run the command that made this run again" in msg and "--partial" in msg, msg
     s = b.grade(folder, partial=True)["scorers"]["exact"]
-    assert s["partial"] == {"no_answer": ["z9"], "not_scored": []} and s["failed"] == 2, s
+    assert s["partial"] == {"no_answer": 1, "not_scored": 0, "e.g.": ["z9"]} and s["failed"] == 2, s
 
 
 @dataclasses.dataclass(frozen=True)
