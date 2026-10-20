@@ -19,7 +19,7 @@ What you write, from least to most:
 | --- | --- |
 | run a benchmark | `Benchmark(task, dataset, scorers).run(SomeAdapter(...), out)`, once per system |
 | add a system | an `Adapter`: a frozen dataclass of its options, and `call(input) -> Call` |
-| add a way of grading | a `Scorer`: a frozen dataclass, `gold(row)` and `score(pred, gold) -> Score` |
+| add a way of grading | a `Scorer`: a frozen dataclass, `gold(row)`, `score(pred, gold) -> Score` and `summarize(lines)`, which returns `headline` and `headline_is` |
 | add a task | a `Task`: `rows(dataset)` and `input(row)`, a row type, and its adapters and scorers |
 
 Where to read next:

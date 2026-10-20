@@ -52,7 +52,7 @@ class Benchmark:
     Three rules say what happens in every case:
 
     1. a run folder answers one exact question: the system and its options, the dataset, the manifest, the
-       task and the choice of rows (`suites`, `sample`, `limit`, `only`). Another question gets another
+       task and the choice of rows (`sample`, `limit`, `only`). Another question gets another
        folder; the same question resumes the same one;
     2. grading reports only a finished run, one where every row it chose has an answer or a recorded failure,
        and a score. Otherwise it refuses, and names the rows and how to finish them; `partial=True` grades
@@ -60,7 +60,7 @@ class Benchmark:
     3. a failure that is the system's (a refusal, an error, an answer that can't be read, a timeout) is
        recorded, and the row counts 0. A failure that is ours (a missing key, an account that can't pay, a
        bug, an interrupt) stops the run with nothing recorded, so running the same command again does the
-       row. A bug prints its whole traceback, and whose code it is.
+       row. A bug is raised as it is, with a note naming the class and the row.
 
     It has six methods:
 
@@ -83,12 +83,17 @@ class Benchmark:
 
     def __post_init__(self) -> None:
         errors.check_dataclass(type(self.task), task.Task)
-        for s in self.scorers: errors.check_dataclass(type(s), scorer.Scorer)
+        for s in self.scorers:
+            errors.check_dataclass(type(s), scorer.Scorer)
+            # Note: refused here, before any call, rather than when grading finds it, after the answers are paid for.
+            if type(s).summarize is scorer.Scorer.summarize:
+                raise ValueError(f"{type(s).__name__} has no summarize: write one that returns the headline "
+                                 "(a number from 0 to 1, higher is better) and headline_is (what it is)")
         if not self.scorers:
-            raise errors.UsageError("a benchmark needs at least one scorer")
+            raise ValueError("a benchmark needs at least one scorer")
         if len(names := [s.folder_name for s in self.scorers]) != len(set(names)):
-            raise errors.UsageError(f"scorers {names} name one results folder twice: the same scorer with the "
-                                    "same options")
+            raise ValueError(f"scorers {names} name one results folder twice: the same scorer with the "
+                             "same options")
 
     def rows(self) -> tuple[data.Row, ...]:
         """Every row of the manifest."""
@@ -100,13 +105,13 @@ class Benchmark:
         return {"dataset": data.dataset_id(self.dataset), "manifest": data.manifest_path(self.manifest),
                 "task": self.task.identity(), "rows": dict(selection or {})}
 
-    def plan(self, system: adapter.Adapter, out: str | Path, *, suites: Iterable[str] | None = None,
-             limit: int = 0, sample: int = 0, only: Iterable[str] | None = None,
+    def plan(self, system: adapter.Adapter, out: str | Path, *, limit: int = 0, sample: int = 0,
+             only: Iterable[str] | None = None,
              timeout: float = adapter.DEFAULT_TIMEOUT, workers: int = 0, retry_failed: bool = False) -> Plan:
         """The run of `system`, in its own folder under `out`, checked before any call.
 
         Args:
-          suites, only, sample, limit: choose the rows (`data.select`). They are part of the run's question,
+          only, sample, limit: choose the rows (`data.select`). They are part of the run's question,
             so another choice of rows is another run, and grading covers exactly these rows.
           timeout: the seconds each row may take.
           workers: how many rows are in flight at once; 0 for the system's own `Adapter.workers`.
@@ -116,14 +121,14 @@ class Benchmark:
             raise TypeError(f"{system!r} is not one adapter instance; make one, e.g. Datalab(mode='accurate'). A run "
                             "is one system: to compare systems, run each")
         if not timeout > 0:
-            raise errors.UsageError(f"timeout is {timeout}; give the seconds a row may take, a positive number")
+            raise ValueError(f"timeout is {timeout}; give the seconds a row may take, a positive number")
         if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
-            raise errors.UsageError(f"workers is {workers!r}; give a whole number, or 0 for the system's own")
+            raise ValueError(f"workers is {workers!r}; give a whole number, or 0 for the system's own")
         if missing := system.missing_keys():
-            raise errors.MissingCredential(f"{system.label} needs {', '.join(missing)}: "
-                                           + " and ".join(f"export {k}=..." for k in missing) + ", then run again")
+            raise ValueError(f"{system.label} needs {', '.join(missing)}: "
+                             + " and ".join(f"export {k}=..." for k in missing) + ", then run again")
         every = self.rows()
-        selection = data.selection(suites, limit, sample, only)
+        selection = data.selection(limit, sample, only)
         chosen = data.select(every, **selection)
         # Note: a limit or sample that takes every row asks the same question as no limit, so it is the same run.
         if len(chosen) == len(every) and set(selection) <= {"limit", "sample"}: selection = {}
@@ -134,7 +139,7 @@ class Benchmark:
                     workers or type(system).workers, retry_failed)
 
     def check(self) -> dict[str, int]:
-        """Checks the dataset before it is used or published, and returns how many rows and suites it has.
+        """Checks the dataset before it is used or published, and returns how many rows it has.
 
         It reads every row (`Task.rows` checks the manifest), builds every row's input (`Task.input`, which
         raises when an input file is missing), and reads every gold (each scorer's `check_gold`). It makes no
@@ -142,7 +147,7 @@ class Benchmark:
         every = self.rows()
         self._inputs(every)
         for s in self.scorers: s.check_gold(every)
-        return {"rows": len(every), "suites": len({r.suite for r in every})}
+        return {"rows": len(every)}
 
     def describe(self, p: Plan) -> str:
         """What `predict(p)` would do, without calling anything. Read it before paying for a run."""
@@ -160,8 +165,8 @@ class Benchmark:
     def predict(self, p: Plan, executor: Callable[[int], cf.Executor] = cf.ThreadPoolExecutor) -> None:
         """Sends every row the run lacks to its system, `p.workers` at a time, and saves each answer as it arrives.
 
-        A failure that is the same for every row (a `Stop`), or a bug, stops the run once the calls in flight
-        are saved. An interrupt does the same. Either way, running the same command again resumes.
+        A failure that is the same for every row (an account, a refused connection), or a bug, stops the run once
+        the calls in flight are saved. An interrupt does the same. Either way, running the same command again resumes.
 
         `executor` makes the pool, given its number of workers: threads on this machine by default. Another
         executor (processes, a cluster, a GPU container next to a model's server) runs `predict_row` for each
@@ -200,7 +205,7 @@ class Benchmark:
         name, its cost and each scorer's summary by folder name.
 
         A run is graded over the rows it answers (its settings.json's `rows`); a folder of your own, over the
-        whole manifest. Grading refuses a run that isn't finished (`errors.Unfinished`); `partial=True` grades
+        whole manifest. Grading refuses a run that isn't finished (a `ValueError`); `partial=True` grades
         it anyway, counting its unfinished rows as failed. `write=False` writes no results (`Scorer.grade`)."""
         r = run if isinstance(run, runs.Run) else runs.Run.at(run)
         every = self.rows()
@@ -237,16 +242,17 @@ class Benchmark:
         if not isinstance(run, runs.Run): run = runs.Run(Path(run), system)
         elif system is not None: run = runs.Run(run.folder, system)
         if run.system is None:
-            raise errors.UsageError(f"{run.folder} needs the system that made it to read its answers again: "
-                                    "pass reread(folder, system), the adapter with the options its settings.json "
-                                    "names")
+            raise ValueError(f"{run.folder} needs the system that made it to read its answers again: "
+                             "pass reread(folder, system), the adapter with the options its settings.json "
+                             "names")
         changed = []
         for x in self.rows():
             if (rec := run.record(x.id)) is None: continue
             try:
                 new = adapter.reread(run.system, self.task.input(x), rec)
-            except errors.Unread as exc:
-                raise errors.bug(f"reading the answer of {x.id}", exc.__cause__ or exc, type(run.system)) from None
+            except Exception as exc:
+                errors.noted(exc, type(run.system), f"reading the answer of {x.id}")
+                raise
             if new != rec:
                 run.save(x.id, new)
                 changed.append(x.id)
@@ -260,8 +266,9 @@ class Benchmark:
             if not (rec := r.record(x.id)) or not rec.get("unread"): continue
             try:
                 r.save(x.id, adapter.reread(r.system, self.task.input(x), rec))
-            except errors.Unread as exc:
-                raise errors.bug(f"reading the answer of {x.id}", exc.__cause__ or exc, type(r.system)) from None
+            except Exception as exc:
+                errors.noted(exc, type(r.system), f"reading the answer of {x.id}")
+                raise
 
     def _inputs(self, rows: Sequence[data.Row]) -> None:
         """Refuses rows whose input file is missing (`Task.input` raises), listing them all."""
@@ -272,18 +279,16 @@ class Benchmark:
             except FileNotFoundError as exc:
                 missing.append(f"{r.id}: {exc}")
         if missing:
-            raise errors.UsageError(f"input files that don't exist: {errors.counted(len(missing), 'row')}, e.g. "
-                                    + "; ".join(missing[:3]))
+            raise ValueError(f"input files that don't exist: {errors.counted(len(missing), 'row')}, e.g. "
+                             + "; ".join(missing[:3]))
 
 
 def _headline(s: dict[str, Any]) -> str:
     """A summary's headline as the log line shows it: the scorer's number over the scored rows, times coverage,
     so a low headline reads as either poor answers or few of them."""
-    if not s["coverage"]: return f"{s['headline']:.3f}: no row was scored"
-    what = s["headline_is"].removesuffix(" × coverage")
-    scored = errors.counted(s["rows"] - s["failed"], "scored row")
-    return (f"{s['headline']:.3f} = {s['headline'] / s['coverage']:.3f} ({what}) on {scored} "
-            f"× coverage {s['coverage']:.3f}")
+    if s["scored"] is None: return f"{s['headline']:.3f}: no row was scored"
+    sc, n = s["scored"], errors.counted(s["rows"] - s["failed"], "scored row")
+    return f"{s['headline']:.3f} = {sc['headline']:.3f} ({sc['headline_is']}) on {n} × coverage {s['coverage']:.3f}"
 
 
 def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: float) -> dict[str, Any]:
@@ -297,23 +302,24 @@ def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: f
     try:
         x = t.input(row)
     except FileNotFoundError as exc:
-        raise errors.Stop(f"the input of row {row.id} disappeared after the run was planned ({exc}); restore it and "
-                          "run the same command again") from None
+        exc.add_note(f"the input of row {row.id} disappeared after the run was planned; restore it and run the same "
+                     "command again")
+        raise
     return adapter.predict(system, x, timeout=timeout)
 
 
 def _saved(r: runs.Run, x: data.Row, f: cf.Future, board: progress.Board) -> BaseException | None:
     """Saves the record `f` holds for row `x` of run `r`, and returns None; or, when it raised, the failure to
-    stop the run with: a bug in the adapter is raised as `errors.Bug`, which names whose code it is."""
+    stop the run with: a bug in the adapter is raised as it is, with a note naming the adapter and the row."""
     try:
         rec = f.result()
-    except errors.Unread as exc:
-        r.save(x.id, exc.record)
-        return errors.bug(f"reading the answer of {x.id} (the answer is saved, and is read again when you run the "
-                          "same command after the fix)", exc.__cause__ or exc, type(r.system))
+    except Exception as exc:
+        if (unread := getattr(exc, "unread", None)) is None:
+            return errors.noted(exc, type(r.system), f"predicting {x.id}")
+        r.save(x.id, unread)
+        return errors.noted(exc, type(r.system), f"reading the answer of {x.id}; the answer is saved, and is read "
+                            "again when you run the same command after the fix")
     except BaseException as exc:
-        if isinstance(exc, Exception) and not isinstance(exc, errors.Stop):
-            return errors.bug(f"predicting {x.id}", exc, type(r.system))
         return exc
     r.save(x.id, rec)
     board.saved(r.name, x.id, rec)

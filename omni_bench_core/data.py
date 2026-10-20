@@ -3,7 +3,7 @@
 A dataset is a folder. It can also be a HuggingFace dataset, which is downloaded whole the first time it is
 used. Either way, it holds three things:
 
-    manifest.parquet       one row per thing to predict: its id, its suite, its input files and its gold file
+    manifest.parquet       one row per thing to predict: its id, its input files and its gold file
     <any folder>/<file>    the input files, with any names; several rows may share one
     <any folder>/<id>.json each row's gold, named after its row
 
@@ -12,7 +12,6 @@ checks only what every task needs:
 
 - each id is a file name, and no two ids are the same ignoring case, because an id names the row's files
   (`predictions/<id>.json`) and some disks ignore case;
-- each suite is a string. A missing, empty or null suite becomes "other";
 - each path is relative and inside the dataset, so the dataset can be moved as one folder. A gold file is
   named `<id>.json`, so a gold can't be graded against another row; and
 - every other column is kept, unread, in the row's `extra`, so a dataset can carry more for scorers of
@@ -37,25 +36,16 @@ log = logging.getLogger(__name__)
 
 HF_PREFIX = "hf://datasets/"
 MANIFEST = "manifest.parquet"
-NO_SUITE = "other"
 DOWNLOAD_ATTEMPTS = 5
 
 
 class Row(Protocol):
-    """What the shared code reads of a row. The task's own row type holds everything else.
-
-    A row has two fields that every task shares:
-
-    - `id`: names the row's files (its prediction, record and gold), so an answer is never graded against
-      another row's gold; and
-    - `suite`: the kind of row it is, such as a scan, a form or a language. Summaries are broken down by
-      suite, so a drop on one kind of row isn't hidden in the average."""
+    """What the shared code reads of a row: its `id`, which names the row's files (its prediction, record and
+    gold), so an answer is never graded against another row's gold. The task's own row type holds everything
+    else, and a scorer reads what it needs of it through `Scorer.row_fields`."""
 
     @property
     def id(self) -> str: ...
-
-    @property
-    def suite(self) -> str: ...
 
 
 def hf_dataset(dataset: str | Path) -> tuple[str, str | None] | None:
@@ -63,14 +53,14 @@ def hf_dataset(dataset: str | Path) -> tuple[str, str | None] | None:
     s = str(dataset)
     form = f"{HF_PREFIX}<org>/<name>[@<revision>]"
     if isinstance(dataset, Path) and s.startswith("hf:"):
-        raise errors.UsageError(f"the dataset {s!r} was made a Path, which folds the '//' out of an address; "
-                                f"pass it as a str: {form}")
+        raise ValueError(f"the dataset {s!r} was made a Path, which folds the '//' out of an address; "
+                         f"pass it as a str: {form}")
     if not s.startswith("hf://"):
         return None
     org, _, name = s.removeprefix(HF_PREFIX).partition("/")
     name, at, revision = name.partition("@")
     if not s.startswith(HF_PREFIX) or not org or not name or "/" in name or (at and not revision):
-        raise errors.UsageError(f"{s!r} does not name a HuggingFace dataset; write it as {form}")
+        raise ValueError(f"{s!r} does not name a HuggingFace dataset; write it as {form}")
     return f"{org}/{name}", revision or None
 
 
@@ -85,7 +75,7 @@ def download_dataset(dataset: str | Path) -> Path:
     if (at := hf_dataset(dataset)) is None:
         root = Path(dataset).expanduser()
         if not root.is_dir():
-            raise errors.UsageError(f"no dataset folder at {root}; pass a folder or {HF_PREFIX}<org>/<name>")
+            raise ValueError(f"no dataset folder at {root}; pass a folder or {HF_PREFIX}<org>/<name>")
         return root
     repo, revision = at
     huggingface_hub = hub()
@@ -109,13 +99,13 @@ def download_dataset(dataset: str | Path) -> Path:
                                                               max_workers=4))
             except (hf_errors.RepositoryNotFoundError, hf_errors.GatedRepoError,
                     hf_errors.RevisionNotFoundError) as exc:
-                raise errors.UsageError(f"can't read dataset {dataset}: {type(exc).__name__}; check the repo and "
-                                        "revision, and that you're logged in with access (hf auth login)") from None
+                raise ValueError(f"can't read dataset {dataset}: {type(exc).__name__}; check the repo and "
+                                 "revision, and that you're logged in with access (hf auth login)") from None
             except (hf_errors.LocalEntryNotFoundError, hf_errors.OfflineModeIsEnabled) as exc:
                 how = ("HF_HUB_OFFLINE is set; unset it" if os.environ.get("HF_HUB_OFFLINE", "") not in ("", "0")
                        else "the Hub can't be reached; connect")
-                raise errors.UsageError(f"can't read dataset {dataset}: it isn't cached and {how}, or pass a folder "
-                                        f"({type(exc).__name__})") from None
+                raise ValueError(f"can't read dataset {dataset}: it isn't cached and {how}, or pass a folder "
+                                 f"({type(exc).__name__})") from None
             except Exception as exc:
                 if attempt == DOWNLOAD_ATTEMPTS - 1: raise
                 log.warning("downloading %s failed (%s: %s); trying again in %ds", dataset, type(exc).__name__,
@@ -130,10 +120,10 @@ def hub() -> Any:
     """The `huggingface_hub` module, which reading an `hf://` dataset needs."""
     try:
         import huggingface_hub
-    except ImportError:
-        raise errors.MissingDependency("reading an hf:// dataset needs huggingface_hub: pip install huggingface_hub "
-                                       "(a benchmark package's [benchmark] extra includes it), or pass a dataset "
-                                       "folder") from None
+    except ImportError as exc:
+        exc.add_note("reading an hf:// dataset needs huggingface_hub: pip install huggingface_hub (a benchmark "
+                     "package's [benchmark] extra includes it), or pass a dataset folder")
+        raise
     return huggingface_hub
 
 
@@ -164,8 +154,8 @@ def manifest_path(manifest: str) -> str:
     """A manifest's path inside its dataset, always written the same way. Refuses a path outside the dataset."""
     m = PurePosixPath(manifest)
     if m.is_absolute() or ".." in m.parts:
-        raise errors.UsageError(f"manifest {manifest} must be a path inside the dataset, relative to it, "
-                                "e.g. manifests/sample.parquet")
+        raise ValueError(f"manifest {manifest} must be a path inside the dataset, relative to it, "
+                         "e.g. manifests/sample.parquet")
     return m.as_posix()
 
 
@@ -184,8 +174,8 @@ def read_manifest(dataset: str | Path, manifest: str = MANIFEST, *, columns: tup
       gold: the column holding the path to each row's gold file. It becomes a full path on this machine.
 
     Returns:
-      The folder, and each row as a dict. The dict holds the row's id, `suite`, `inputs`, `gold` and
-      `columns`, and `extra`, which holds every other column of the manifest, unread.
+      The folder, and each row as a dict. The dict holds the row's id, `inputs`, `gold` and `columns`, and
+      `extra`, which holds every other column of the manifest, unread.
     """
     import pyarrow.parquet as pq
 
@@ -195,16 +185,16 @@ def read_manifest(dataset: str | Path, manifest: str = MANIFEST, *, columns: tup
     path = root / manifest
     need = tuple(dict.fromkeys((id, *inputs, *([gold] if gold else []), *columns)))
     if not path.exists():
-        raise errors.UsageError(f"no manifest at {path}; a manifest is a parquet file inside the dataset with "
-                                f"one row per input, with columns {', '.join(need)}")
+        raise ValueError(f"no manifest at {path}; a manifest is a parquet file inside the dataset with "
+                         f"one row per input, with columns {', '.join(need)}")
     table = pq.read_table(path)
     if absent := [c for c in need if c not in table.column_names]:
-        raise errors.UsageError(f"{path} has no column {', '.join(absent)}; its rows need {', '.join(need)}, "
-                                f"and it has {', '.join(table.column_names) or 'none'}")
+        raise ValueError(f"{path} has no column {', '.join(absent)}; its rows need {', '.join(need)}, "
+                         f"and it has {', '.join(table.column_names) or 'none'}")
     rows = tuple(row(r, n, path, root, need, id=id, inputs=inputs, gold=gold)
                  for n, r in enumerate(table.to_pylist()))
     if not rows:
-        raise errors.UsageError(f"the manifest {path} names no rows")
+        raise ValueError(f"the manifest {path} names no rows")
     unique([r[id] for r in rows], path)
     return root, rows
 
@@ -213,26 +203,21 @@ def row(r: dict[str, Any], n: int, path: Path, root: Path, need: tuple[str, ...]
         inputs: tuple[str, ...], gold: str | None) -> dict[str, Any]:
     """Manifest row `n`, checked. Its paths become full paths under `root`, and its other columns go into
     `extra`. `path` is the manifest's path, used only in messages."""
-    r = {"suite": None, **r}
     i = r[id]
     if not isinstance(i, str) or not i or i in (".", "..") or Path(i).name != i:
-        raise errors.UsageError(f"{path}: row {n + 1} has {id} {i!r}, which is not a file name; it names the "
-                                "row's prediction and record, so it is one path component")
-    if r["suite"] is not None and not isinstance(r["suite"], str):
-        raise errors.UsageError(f"{path}: row {i} has suite {r['suite']!r}; give a string, or null for {NO_SUITE!r}")
+        raise ValueError(f"{path}: row {n + 1} has {id} {i!r}, which is not a file name; it names the "
+                         "row's prediction and record, so it is one path component")
     for c in inputs:
         if not _inside(r[c]):
-            raise errors.UsageError(f"{path}: row {i} has {c} {r[c]!r}; give a relative path to a file inside the "
-                                    "dataset")
+            raise ValueError(f"{path}: row {i} has {c} {r[c]!r}; give a relative path to a file inside the "
+                             "dataset")
         r[c] = root / r[c]
     if gold:
         if not _inside(r[gold], i):
-            raise errors.UsageError(f"{path}: row {i} has {gold} {r[gold]!r}; give a relative path inside the "
-                                    f"dataset named for its row, e.g. gold/{i}.json")
+            raise ValueError(f"{path}: row {i} has {gold} {r[gold]!r}; give a relative path inside the "
+                             f"dataset named for its row, e.g. gold/{i}.json")
         r[gold] = root / r[gold]
-    r["suite"] = r["suite"] if (r["suite"] or "").strip() else NO_SUITE
-    keep = (*need, "suite")
-    return {**{c: r[c] for c in keep}, "extra": {k: v for k, v in r.items() if k not in keep}}
+    return {**{c: r[c] for c in need}, "extra": {k: v for k, v in r.items() if k not in need}}
 
 
 def unique(ids: Sequence[str], path: Path) -> None:
@@ -243,61 +228,51 @@ def unique(ids: Sequence[str], path: Path) -> None:
     by: dict[str, list[str]] = {}
     for i in ids: by.setdefault(i.casefold(), []).append(i)
     if twice := [xs for xs in by.values() if len(xs) > 1]:
-        raise errors.UsageError(f"{path}: ids more than once, ignoring case: "
-                                + "; ".join(" and ".join(xs) for xs in twice[:3]))
+        raise ValueError(f"{path}: ids more than once, ignoring case: "
+                         + "; ".join(" and ".join(xs) for xs in twice[:3]))
 
 
-def selection(suites: Iterable[str] | None = None, limit: int = 0, sample: int = 0,
-              only: Iterable[str] | None = None) -> dict[str, Any]:
+def selection(limit: int = 0, sample: int = 0, only: Iterable[str] | None = None) -> dict[str, Any]:
     """A choice of rows, written the same way every time: only what was given, names sorted. It is part of
     a run's question, so it names the run's folder, and grading reads it back to know which rows the run
     answers. `{}` is every row."""
     out: dict[str, Any] = {}
-    if (s := _names(suites, "suites")) is not None: out["suites"] = sorted(s)
     if (o := _names(only, "only")) is not None: out["only"] = sorted(o)
     if sample: out["sample"] = sample
     if limit: out["limit"] = limit
     return out
 
 
-def select[R: Row](rows: Sequence[R], suites: Iterable[str] | None = None, limit: int = 0, sample: int = 0,
+def select[R: Row](rows: Sequence[R], limit: int = 0, sample: int = 0,
                    only: Iterable[str] | None = None) -> tuple[R, ...]:
     """The rows to run, in their order. The filters apply in this order:
 
-    1. `suites`: only rows of these suites;
-    2. `only`: only rows with these ids;
-    3. `sample`: this many rows, spread evenly over the suites; and
-    4. `limit`: the first this many rows.
+    1. `only`: only rows with these ids;
+    2. `sample`: this many rows, evenly spaced over the manifest; and
+    3. `limit`: the first this many rows.
 
-    `sample` takes one row from each suite in turn, evenly spaced within the suite. So a run sees every kind
-    of row, and sees the same rows each time: two systems run with the same `sample` answer the same rows.
-    `sample` and `limit` are two ways to say how many rows, so only one may be given."""
-    suites, only = _names(suites, "suites"), _names(only, "only")
+    `sample` takes rows evenly spaced in the manifest's order, so it sees the same rows each time: two systems
+    run with the same `sample` answer the same rows. A dataset whose manifest is grouped by kind (by language,
+    by source) gets a sample that reaches across them. `sample` and `limit` are two ways to say how many rows,
+    so only one may be given."""
+    only = _names(only, "only")
     for name, n in (("limit", limit), ("sample", sample)):
         if isinstance(n, bool) or not isinstance(n, int): raise TypeError(f"{name} is a whole number, not {n!r}")
-        if n < 0: raise errors.UsageError(f"{name} is {n}; it counts rows, so give 0 (no limit) or more")
+        if n < 0: raise ValueError(f"{name} is {n}; it counts rows, so give 0 (no limit) or more")
     if limit and sample:
-        raise errors.UsageError(f"give sample ({sample}) or limit ({limit}), not both: sample spreads its rows over "
-                                "every suite, limit takes the first ones")
+        raise ValueError(f"give sample ({sample}) or limit ({limit}), not both: sample spreads its rows over "
+                         "the manifest, limit takes the first ones")
     xs = tuple(rows)
-    known = {r.suite for r in xs}
-    if suites is not None and (bad := sorted(suites - known)):
-        raise errors.UsageError(f"unknown suites {bad}; the dataset's suites are {sorted(known)}")
-    xs = tuple(r for r in xs if suites is None or r.suite in suites)
     if only is not None:
         if bad := sorted(only - {r.id for r in xs}):
-            raise errors.UsageError(f"rows asked for that aren't in the dataset: {errors.counted(len(bad), 'row')}, "
-                                    f"e.g. {bad[:3]}")
+            raise ValueError(f"rows asked for that aren't in the dataset: {errors.counted(len(bad), 'row')}, "
+                             f"e.g. {bad[:3]}")
         xs = tuple(r for r in xs if r.id in only)
     if sample and xs:
-        by: dict[str, list[R]] = {}
-        for r in xs: by.setdefault(r.suite, []).append(r)
-        k = -(-sample // len(by))
-        spread = [[ys[i * len(ys) // min(k, len(ys))] for i in range(min(k, len(ys)))] for ys in by.values()]
-        chosen = {x.id for x in [ys[i] for i in range(k) for ys in spread if i < len(ys)][:sample]}
-        xs = tuple(r for r in xs if r.id in chosen)
+        k = min(sample, len(xs))
+        xs = tuple(xs[i * len(xs) // k] for i in range(k))
     if not (xs := xs[:limit] if limit else xs):
-        raise errors.UsageError("no rows selected; check suites, only, sample and limit")
+        raise ValueError("no rows selected; check only, sample and limit")
     return xs
 
 
@@ -327,10 +302,10 @@ def _on_hub(dataset: str | Path, manifest: str) -> None:
 
     try:
         if not huggingface_hub.repo_exists(at[0], repo_type="dataset"):
-            raise errors.UsageError(f"the Hugging Face Hub shows no dataset {at[0]}: it doesn't exist, or it is private "
-                                    "and this machine has no token that can read it (set HF_TOKEN)")
+            raise ValueError(f"the Hugging Face Hub shows no dataset {at[0]}: it doesn't exist, or it is private "
+                             "and this machine has no token that can read it (set HF_TOKEN)")
         missing = not huggingface_hub.file_exists(at[0], manifest, repo_type="dataset", revision=at[1])
     except OSError:
         missing = False
     if missing:
-        raise errors.UsageError(f"there is no {manifest} in {dataset}; name another manifest, or another dataset")
+        raise ValueError(f"there is no {manifest} in {dataset}; name another manifest, or another dataset")

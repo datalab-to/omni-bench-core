@@ -32,7 +32,6 @@ LOCK = threading.Lock()
 @dataclasses.dataclass(frozen=True)
 class Doc:
     doc_id: str
-    suite: str
     doc_path: Path
     gt_path: Path
     extra: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -102,6 +101,11 @@ class Exact(scorer.Scorer):
         diffs = [{"at": i, "pred": a, "gold": b} for i, (a, b) in enumerate(zip(pred, gold)) if a != b]
         return scorer.Score({"exact": pred == gold, "length": len(pred)}, diffs or None)
 
+    def summarize(self, lines):
+        exact = sum(x["exact"] for x in lines) / len(lines)
+        return {"headline": exact, "headline_is": "exact", "exact": exact,
+                "length": sum(x["length"] for x in lines) / len(lines)}
+
 
 @dataclasses.dataclass(frozen=True)
 class ExactPooled(Exact):
@@ -141,12 +145,17 @@ class Agree(Exact):
         return scorer.Score({"agree": rec["output"]["verdict"] == "yes", "judge_usd": rec["cost"]["usd"]},
                             [rec["output"]])
 
+    def summarize(self, lines):
+        agree = sum(x["agree"] for x in lines) / len(lines)
+        return {"headline": agree, "headline_is": "agree", "agree": agree,
+                "judge_usd": sum(x["judge_usd"] for x in lines) / len(lines)}
+
 
 TEXTS = {"a1": ("letters", "hello"), "a2": ("letters", "world"), "b1": ("numbers", "123"),
          "b2": ("numbers", "456"), "c1": ("other", "refuse me")}
 
 
-def dataset(root: Path, texts=TEXTS, gold=None, suites: bool = True) -> Path:
+def dataset(root: Path, texts=TEXTS, gold=None) -> Path:
     (root / "docs").mkdir(parents=True)
     (root / "gold").mkdir()
     for i, (_, t) in texts.items():
@@ -154,7 +163,6 @@ def dataset(root: Path, texts=TEXTS, gold=None, suites: bool = True) -> Path:
         (root / "gold" / f"{i}.json").write_text(json.dumps(gold(t) if gold else {"text": t}))
     cols = {"doc_id": list(texts), "doc_path": [f"docs/{i}.txt" for i in texts],
             "gt_path": [f"gold/{i}.json" for i in texts], "lang": ["en"] * len(texts)}
-    if suites: cols["suite"] = [s for s, _ in texts.values()]
     pq.write_table(pa.table(cols), root / "manifest.parquet")
     return root
 
@@ -166,16 +174,17 @@ def bench(root: Path, *scorers: scorer.Scorer) -> benchmark.Benchmark:
 def refused(f, *args, match: str = "", **kwargs) -> str:
     try:
         f(*args, **kwargs)
-    except (errors.UsageError, TypeError) as exc:
-        assert match in str(exc), f"{match!r} not in {exc}"
-        return str(exc)
+    except (TypeError, ValueError, OSError) as exc:
+        said = "\n".join([str(exc), *getattr(exc, "__notes__", [])])     # the message, then the core's notes
+        assert match in said, f"{match!r} not in {said}"
+        return said
     raise AssertionError(f"{f.__name__} was not refused")
 
 
 def test_defaults(tmp: Path) -> None:
     assert (GoldEcho.name, ExactPooled.name, Copying.name) == ("gold_echo", "exact_pooled", "copying")
-    rows = bench(dataset(tmp / "d", suites=False)).rows()
-    assert {r.suite for r in rows} == {"other"} and rows[0].extra == {"lang": "en"} and rows[0].doc_path.is_absolute()
+    rows = bench(dataset(tmp / "d")).rows()
+    assert rows[0].extra == {"lang": "en"} and rows[0].doc_path.is_absolute()
 
 
 def test_gold_echo_scores_one(tmp: Path) -> None:
@@ -183,8 +192,8 @@ def test_gold_echo_scores_one(tmp: Path) -> None:
     g = b.run(GoldEcho(), tmp / "runs")
     name = g["run"]
     s = g["scorers"]["exact"]
-    assert s["headline"] == 1.0 and s["exact"] == 1.0 and s["length"] == 5.0, s
-    assert s["per_suite"]["numbers"] == {"scored": 2, "exact": 1.0, "length": 3.0}
+    assert s["headline"] == 1.0 and s["scored"]["exact"] == 1.0 and s["scored"]["length"] == 5.0, s
+    assert s["scored"]["headline_is"] == "exact" and s["headline_is"] == "scored.headline × coverage", s
     assert g["cost"] == {"usd": None, "credits": None}
     assert (tmp / "runs" / name / "exact" / "scores.jsonl").exists()
     assert not (tmp / "runs" / name / "exact" / "details").exists()
@@ -220,7 +229,7 @@ def test_a_choice_of_rows_is_its_own_finished_run(tmp: Path) -> None:
     g = b.run(GoldEcho(), tmp / "runs", limit=2)
     few = g["run"]
     s = g["scorers"]["exact"]
-    assert s["rows"] == 2 and s["headline"] == 1.0 and s["headline_is"] == "exact × coverage", s
+    assert s["rows"] == 2 and s["headline"] == 1.0 and s["scored"]["headline_is"] == "exact", s
     g = b.run(GoldEcho(), tmp / "runs")
     every = g["run"]
     assert every != few and g["scorers"]["exact"]["rows"] == 5, (few, every)     # another question, another folder
@@ -312,7 +321,6 @@ def test_refused_before_any_call(tmp: Path) -> None:
     name = functools.partial(runs.folder_name, question=q)
     assert name(Copy()) == name(Copy(temperature=0.0)) != name(Copy(upper=True))
     assert runs.folder_name(Copy(), q) != runs.folder_name(Copy(), b.question({"sample": 2}))
-    refused(b.plan, Copy(), tmp / "runs", sample=2, suites=["nope"], match="unknown suites")
     refused(b.plan, [Copy()], tmp / "runs", match="not one adapter instance")
     refused(b.plan, GoldEcho(), tmp / "runs", workers=-1, match="workers is -1")
     refused(benchmark.Benchmark, Copying(), tmp / "ok", (), match="at least one scorer")
@@ -335,7 +343,7 @@ def test_judge_cached_and_unscored(tmp: Path) -> None:
     b = bench(dataset(tmp / "d", {**TEXTS, "f1": ("other", "flaky")}), Agree(), Agree(Judge(strict=False)))
     try:
         b.run(GoldEcho(), tmp / "runs")
-    except errors.Unfinished as exc:
+    except ValueError as exc:
         assert "1 row not scored" in str(exc) and "f1" in str(exc) and "grade again" in str(exc), exc
     else:
         raise AssertionError("a row the judge didn't answer was graded")
@@ -349,7 +357,7 @@ def test_judge_cached_and_unscored(tmp: Path) -> None:
     assert JUDGED.count("flaky") == 2 and len(JUDGED) == 7, JUDGED
     assert all(g["scorers"][f]["headline"] == 1.0 for f in (strict, loose)), g
     assert g["scorers"][strict]["options"] == {"judge": {"system": "judge", "strict": True}}
-    assert abs(g["scorers"][strict]["judge_usd"] - 0.01) < 1e-9
+    assert abs(g["scorers"][strict]["scored"]["judge_usd"] - 0.01) < 1e-9
     JUDGED.clear()
     b.grade(tmp / "runs" / name)
     assert JUDGED == []
@@ -372,7 +380,7 @@ def test_cache_keys(tmp: Path) -> None:
     (tmp / "d" / "gold" / "a1.json").write_text(json.dumps({"text": "hullo"}))
     s = b.grade(tmp / "runs" / name)["scorers"][Agree().folder_name]
     assert JUDGED == ["hullo"], JUDGED                    # a changed gold is a new key
-    assert s["agree"] == 0.8 and s["judge_usd"] == 0.01, s
+    assert s["scored"]["agree"] == 0.8 and s["scored"]["judge_usd"] == 0.01, s
     fresh = json.loads((tmp / "runs" / name / Agree().folder_name / "scores.jsonl").read_text().splitlines()[0])
     JUDGED.clear()
     b.grade(tmp / "runs" / name)
@@ -401,7 +409,7 @@ def test_score_all_override_is_cached(tmp: Path) -> None:
     BATCHES.clear()
     (tmp / "d" / "gold" / "b2.json").write_text(json.dumps({"text": "457"}))
     s = b.grade(tmp / "runs" / name)["scorers"][BatchAgree().folder_name]
-    assert BATCHES == [["b2"]] and s["agree"] == 0.8, (BATCHES, s)    # only the row with no kept score
+    assert BATCHES == [["b2"]] and s["scored"]["agree"] == 0.8, (BATCHES, s)    # only the row with no kept score
 
 
 def test_grade_is_not_overridden(tmp: Path) -> None:
@@ -419,8 +427,9 @@ class ByLanguage(Exact):
         return {"lang": row.extra["lang"], "pages": 1}
 
     def summarize(self, lines):
-        out = scorer.per(lines, "row.lang", lambda xs: {"n": len(xs)})
-        return {"headline": super().summarize(lines)["headline"], **out}
+        by: dict[str, int] = {}
+        for x in lines: by[x["row"]["lang"]] = by.get(x["row"]["lang"], 0) + 1
+        return {**super().summarize(lines), "per_lang": {k: {"n": n} for k, n in by.items()}}
 
 
 def test_row_fields_and_dry_grading(tmp: Path) -> None:
@@ -428,7 +437,7 @@ def test_row_fields_and_dry_grading(tmp: Path) -> None:
     g = b.run(GoldEcho(), tmp / "runs")
     name = g["run"]
     s = g["scorers"]["by_language"]
-    assert s["per_lang"] == {"en": {"n": 5}} and s["headline"] == 1.0, s
+    assert s["scored"]["per_lang"] == {"en": {"n": 5}} and s["headline"] == 1.0, s
     line = json.loads((tmp / "runs" / name / "by_language" / "scores.jsonl").read_text().splitlines()[0])
     assert line["row"] == {"lang": "en", "pages": 1}
     assert Exact().summarize([line])["exact"] == 1.0 and "pages" not in Exact().summarize([line])   # not averaged
@@ -447,8 +456,8 @@ class Overcounts(Exact):
 
 
 def test_summary_counts_are_grades(tmp: Path) -> None:
-    b = bench(dataset(tmp / "d"), Overcounts())
-    refused(b.run, Copy(), tmp / "runs", match="['failed'], which grade sets")
+    s = bench(dataset(tmp / "d"), Overcounts()).run(Copy(), tmp / "runs")["scorers"]["overcounts"]
+    assert s["failed"] == 1 and s["scored"]["failed"] == 0, s     # a scorer's own numbers never replace grade's
 
 
 @dataclasses.dataclass(frozen=True)
@@ -513,7 +522,7 @@ def test_failed_calls_keep_cost_and_what_was_sent(tmp: Path) -> None:
         refused_stop = False
         try:
             adapter.predict(Billing(), tmp / f"{name}.txt")
-        except errors.AccountFailure:
+        except PermissionError:
             refused_stop = True
         assert refused_stop, name
     (tmp / "b.txt").write_text("busy")
@@ -528,7 +537,7 @@ def test_failed_calls_keep_cost_and_what_was_sent(tmp: Path) -> None:
 def test_dataset_check(tmp: Path) -> None:
     b = benchmark.Benchmark(Copying(), tmp / "d", [Exact()])
     dataset(tmp / "d")
-    assert b.check() == {"rows": 5, "suites": 3}
+    assert b.check() == {"rows": 5}
     (tmp / "d" / "docs" / "a1.txt").unlink()
     refused(b.check, match="input files that don't exist: 1 row")
 
@@ -594,7 +603,7 @@ def test_a_stop_records_nothing_and_grades_nothing(tmp: Path) -> None:
     b = bench(dataset(tmp / "d", {**TEXTS, "z9": ("other", "account")}))
     try:
         b.run(Copy(), tmp / "runs", workers=1)
-    except errors.AccountFailure:
+    except PermissionError:
         pass
     else:
         raise AssertionError("an account failure was not raised")
@@ -658,10 +667,8 @@ def test_a_refused_connection_stops_the_run(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"))
     try:
         b.run(Unserved(), tmp / "runs")
-    except errors.Bug:
-        raise AssertionError("a server that isn't running was taken for a bug") from None
-    except errors.Stop as exc:
-        assert "connection was refused" in str(exc) and "start it" in str(exc), exc
+    except ConnectionRefusedError as exc:     # raised as it is, with a note saying what to do
+        assert "connection was refused" in exc.__notes__[0] and "start it" in exc.__notes__[0], exc.__notes__
     else:
         raise AssertionError("a refused connection didn't stop the run")
     [folder] = (tmp / "runs").iterdir()
@@ -681,8 +688,8 @@ def test_a_scorer_bug_names_its_row(tmp: Path) -> None:
     name = b.plan(GoldEcho(), tmp / "runs").run.name
     try:
         b.run(GoldEcho(), tmp / "runs")
-    except errors.Bug as exc:
-        assert "Crashes raised KeyError while scoring a2" in str(exc) and "Traceback" in str(exc), exc
+    except KeyError as exc:      # the scorer's own exception, with a note saying where
+        assert exc.__notes__ == ["Crashes raised this while scoring a2"], exc.__notes__
     else:
         raise AssertionError("a bug in a scorer was not raised")
     assert not (tmp / "runs" / name / "crashes" / "summary.json").exists()
@@ -738,8 +745,9 @@ def test_a_bug_in_read_stops_keeps_the_answer_and_a_rerun_reads_it(tmp: Path) ->
     b = bench(dataset(tmp / "d", {k: v for k, v in TEXTS.items() if k != "c1"}))
     try:
         b.run(MisReads(), tmp / "runs", workers=1)
-    except errors.Bug as exc:
-        assert "MisReads raised KeyError while reading the answer of a2" in str(exc) and "is saved" in str(exc), exc
+    except KeyError as exc:
+        [note] = exc.__notes__
+        assert "MisReads raised this while reading the answer of a2" in note and "is saved" in note, note
     else:
         raise AssertionError("a bug in read was counted instead of stopping the run")
     [folder] = (tmp / "runs").iterdir()
@@ -758,8 +766,8 @@ def test_a_bug_in_prediction_stops_grading_and_failures_keep_their_traceback(tmp
     assert rec["error"]["type"] == "SystemFailed" and "in call" in rec["error"]["traceback"], rec["error"]
     try:
         bench(tmp / "d", PredictionBug()).grade(tmp / "runs" / name)
-    except errors.Bug as exc:
-        assert "PredictionBug raised KeyError while reading the prediction of a1" in str(exc), exc
+    except KeyError as exc:
+        assert exc.__notes__ == ["PredictionBug raised this while reading the prediction of a1"], exc.__notes__
     else:
         raise AssertionError("a bug in prediction() was counted instead of stopping grading")
 
@@ -769,7 +777,7 @@ def test_a_missing_key_is_refused_before_any_call(tmp: Path) -> None:
     CALLS.clear()
     try:
         b.plan(Keyed(), tmp / "runs")
-    except errors.MissingCredential as exc:
+    except ValueError as exc:
         assert "keyed needs OMNI_BENCH_TEST_KEY" in str(exc) and "export OMNI_BENCH_TEST_KEY=" in str(exc), exc
     else:
         raise AssertionError("a missing key was not refused")
@@ -780,20 +788,63 @@ def test_a_bug_stops_the_run_and_prints_its_traceback(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"))
     try:
         b.run(Buggy(), tmp / "runs", workers=1)
-    except errors.Bug as exc:
-        msg = str(exc)
+    except KeyError as exc:      # raised as it is: the adapter's own exception and traceback
+        assert exc.__notes__ == ["Buggy raised this while predicting b1"], exc.__notes__
+        assert exc.__traceback__ is not None
     else:
         raise AssertionError("a bug in an adapter was not raised")
     [folder] = (tmp / "runs").iterdir()
-    assert "Buggy raised KeyError while predicting b1" in msg and "bug in your Buggy" in msg, msg
-    assert "Traceback" in msg and "omni-bench-core " in msg and "Python 3." in msg, msg
     assert not (folder / "records" / "b1.json").exists() and sorted(p.name for p in folder.iterdir()) == [
         "predictions", "records", "settings.json"]
 
 
-def test_sample_spreads_over_suites(tmp: Path) -> None:
+def test_sample_spreads_over_the_manifest(tmp: Path) -> None:
     rows = bench(dataset(tmp / "d")).rows()
-    assert {r.suite for r in data.select(rows, sample=3)} == {"letters", "numbers", "other"}
+    assert [r.id for r in data.select(rows, sample=3)] == ["a1", "a2", "b2"]     # rows 0, 1 and 3 of 5
+    assert [r.id for r in data.select(rows, sample=9)] == [r.id for r in rows]
+
+
+@dataclasses.dataclass(frozen=True)
+class NoSummary(scorer.Scorer):
+    def gold(self, row):
+        return None
+
+    def score(self, pred, gold):
+        return scorer.Score({"n": 1})
+
+
+@dataclasses.dataclass(frozen=True)
+class Headline(Exact):
+    value: Any = 2.0
+    what: Any = "exact"
+
+    def summarize(self, lines):
+        return {"headline": self.value, "headline_is": self.what}
+
+
+@dataclasses.dataclass(frozen=True)
+class NoHeadline(Exact):
+    def summarize(self, lines):
+        return {"exact": 1.0, "headline_is": "exact"}
+
+
+@dataclasses.dataclass(frozen=True)
+class Status(Exact):
+    def score(self, pred, gold):
+        return scorer.Score({"status": "ok", "exact": pred == gold, "length": 1})
+
+
+def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(tmp: Path) -> None:
+    refused(bench, dataset(tmp / "d"), NoSummary(), match="NoSummary has no summarize")
+    for value, what, match in ((2.0, "exact", '"headline": 2.0'), (-0.1, "exact", '"headline": -0.1'),
+                               (True, "exact", '"headline": True'), (None, "exact", '"headline": None'),
+                               (0.5, "", '"headline_is" key')):
+        refused(bench(tmp / "d", Headline(value, what)).run, GoldEcho(), tmp / f"runs-{value}-{what}", match=match)
+    refused(bench(tmp / "d", NoHeadline()).run, GoldEcho(), tmp / "runs-nohead", match='a "headline" key')
+    refused(bench(tmp / "d", Status()).run, GoldEcho(), tmp / "runs-status", match="['status']")
+    every = dataset(tmp / "refused", {"r1": ("", "refuse 1"), "r2": ("", "refuse 2")})
+    s = bench(every).run(Copy(), tmp / "runs-none")["scorers"]["exact"]
+    assert s["scored"] is None and s["headline"] == 0.0 and s["failed"] == 2, s   # summarize is never called
 
 
 if __name__ == "__main__":

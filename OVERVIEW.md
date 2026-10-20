@@ -61,28 +61,26 @@ Each piece below has a small example from [`tests/test_core.py`](https://github.
 
 A dataset is a folder, or an `hf://` address of a Hugging Face dataset. It holds:
 
-- `manifest.parquet`: one line per row, with its `id`, its `suite` (a group of rows, such as "tables" or
-  "handwriting") and the paths of its files;
+- `manifest.parquet`: one line per row, with its `id` and the paths of its files;
 - the input files, such as PDFs; and
 - one gold file per row: the correct answer.
 
 ```
   my-dataset/
-    manifest.parquet          doc_id | suite   | doc_path      | gt_path
-                              a1     | letters | docs/a1.txt   | gold/a1.json
-                              b1     | numbers | docs/b1.txt   | gold/b1.json
+    manifest.parquet          doc_id | doc_path      | gt_path
+                              a1     | docs/a1.txt   | gold/a1.json
+                              b1     | docs/b1.txt   | gold/b1.json
     docs/a1.txt               hello
     gold/a1.json              {"text": "hello"}
 ```
 
 A row is one line of the manifest, as a frozen dataclass. It holds paths, never file contents, so a large
-dataset fits in memory. It must have an `id` and a `suite`.
+dataset fits in memory. It must have an `id`; everything else is the task's.
 
 ```python
 @dataclasses.dataclass(frozen=True)
 class Doc:
     doc_id: str
-    suite: str
     doc_path: Path
     gt_path: Path
     extra: dict[str, Any] = dataclasses.field(default_factory=dict)   # the manifest's other columns
@@ -157,9 +155,9 @@ You don't write retries, timeouts or error handling. The core wraps every call i
       +-- 429 or 5xx (transient)  -> wait, call again, up to `retries` times
       +-- SystemFailed (a 400 ...) -> recorded as the row's error, with its traceback; the run goes on
       +-- past the timeout        -> recorded as a timeout, even if an answer came later
-      +-- 401, 402 (the account)  -> the whole run stops, since every row would fail
-      +-- connection refused      -> the whole run stops: nothing listens at the address
-      +-- any other exception     -> a bug: the run stops and prints its traceback
+      +-- 401, 402 (the account)  -> PermissionError: the whole run stops, since every row would fail
+      +-- connection refused      -> raised as it is: the whole run stops, nothing listens at the address
+      +-- any other exception     -> raised as it is, with a note naming the adapter and the row
 ```
 
 What your `call` and `read` raise decides which of these happens. One rule covers them: a row counts 0 only
@@ -169,12 +167,12 @@ when you say the system failed.
   system failed on this row. It is recorded with its traceback and counts 0, and a transient status is
   retried first. Raise it in `read` for an answer you can't use (an LLM's broken JSON), or wrap the reading
   in `with adapter.reading("..."):`, which raises it for you;
-- `errors.Stop(message)`, or one of its kinds (`MissingCredential`, `AccountFailure`): the run can't go on
-  for any row. Say what to fix in the message. Declaring `keys` makes the core raise `MissingCredential`
-  before any call, so you rarely raise it yourself; and
-- anything else: a bug in your adapter. The run stops, and prints the whole traceback, whose code it is, and
-  the versions a bug report needs. If `read` raised it, the answer is kept, and is read again with no call
-  when you run the same command after the fix.
+- anything else stops the run, raised as it is, with its traceback and a note naming the adapter and the
+  row. Use a native exception with a message that says what to fix: a `ValueError` for a wrong option, say.
+  Declaring `keys` makes the core refuse a missing key (a `ValueError`) before any call, and a 401 or 402
+  becomes a `PermissionError`, so you rarely raise one for the account yourself. A bug in your adapter
+  stops the run the same way; if `read` raised it, the answer is kept, and is read again with no call when
+  you run the same command after the fix.
 
 ### Run
 
@@ -182,7 +180,7 @@ A run is one system's answers to one exact question, kept in a folder. You never
 read its files, so it helps to know what is in it.
 
 The question is everything that changes the answers: the system and its options, the dataset, the manifest,
-the task, and which rows (`suites`, `sample`, `limit`, `only`). The folder's name is a digest of all of it:
+the task, and which rows (`sample`, `limit`, `only`). The folder's name is a digest of all of it:
 
 ```
   runs/copy-1a2b3c4d/                 <system name>-<digest of the question>
@@ -231,6 +229,10 @@ class Exact(scorer.Scorer):
     def score(self, pred: str, gold: str) -> scorer.Score:
         diffs = [{"at": i, "pred": a, "gold": b} for i, (a, b) in enumerate(zip(pred, gold)) if a != b]
         return scorer.Score({"exact": pred == gold, "length": len(pred)}, diffs or None)
+
+    def summarize(self, lines: list[dict]) -> dict:           # the scored rows' lines as one summary
+        exact = sum(x["exact"] for x in lines) / len(lines)
+        return {"headline": exact, "headline_is": "exact", "exact": exact}
 ```
 
 Grading turns each row into one line of `scores.jsonl`, and all the lines into one summary:
@@ -242,14 +244,22 @@ Grading turns each row into one line of `scores.jsonl`, and all the lines into o
                                                              |
                                                          summarize
                                                              v
-           {"headline": 0.333, "headline_is": "exact × coverage", "exact": 0.5, "coverage": 0.667,
-            "rows": 3, "failed": 1, "per_suite": {...}}
+           {"headline": 0.333, "headline_is": "scored.headline × coverage",
+            "rows": 3, "failed": 1, "coverage": 0.667,
+            "scored": {"headline": 0.5, "headline_is": "exact", "exact": 0.5}}
 ```
 
-By default the summary is the mean of each number over the scored rows, overall and per suite. The headline
-is that number for the first field, or for `headline_field` when you set it, times coverage: the share of
-rows that didn't fail, so a failed row counts as 0. `headline_is` says so in the file. A scorer whose rows
-combine in another way, such as one rate over every row's counts, writes its own `summarize`.
+A line is one row's grade, and scores.jsonl holds every row's. The core writes what the row is (`id`,
+`status`, and `row` when the scorer has `row_fields`), then the numbers `score` returned. A failed row's
+line holds its `error` instead.
+
+The handoff is `summarize`. Every scorer writes it, because only the scorer knows how its rows combine (a
+mean, or one rate over every row's counts). It is given only the scored rows' lines, without their status,
+and returns `headline`, a number from 0 to 1 where higher is better, and `headline_is`, what the headline
+is; anything else in it is the scorer's own. The core keeps it under `scored`, and adds what it knows:
+`rows`, `failed`, `coverage`, and the top `headline`, `scored`'s headline times coverage, so a failed row
+counts as 0. When no row was scored, `summarize` isn't called, `scored` is null and the headline is 0. The
+core refuses a headline outside 0 to 1, because counting a failure as 0 only makes sense on that scale.
 
 `Scorer.grade` runs those steps and applies the rules (below). You can't override it, so every scorer
 follows the same rules.
@@ -365,7 +375,7 @@ scorer can't break them.
    on a command line) grades anyway and counts those rows as failed; the summary then says so, with how many
    and a few of their ids.
 3. A row counts 0 only when code says, on purpose, that the system failed, by raising `errors.SystemFailed`.
-   Any other exception stops the run and prints its traceback. A stop keeps every answer that was paid for,
+   Any other exception stops the run and is raised as it is. A stop keeps every answer that was paid for,
    so running the same command again after the fix costs nothing for the rows already done.
 
 What that means, case by case:
@@ -377,7 +387,7 @@ What that means, case by case:
 | the system times out, or keeps answering 429 or 5xx | the row is recorded as failed, and the run goes on; an answer that comes after the timeout counts as a timeout | 0 | optionally run again with `retry_failed=True` (`--retry-failed`) |
 | your key is missing or wrong, or your account is out of credits | the run stops and says why; a missing key stops it before any call | not yet | fix it, then run the same command again |
 | a model server you host isn't running | the run stops and says so | not yet | start it, then run the same command again |
-| an adapter's or a scorer's code raises anything else (a bug) | the run stops, prints the whole traceback, and says whose code it is and where to report it; an answer `read` crashed on is kept, unread | not yet | report it; run the same command again after a fix, which reads kept answers again with no call |
+| an adapter's or a scorer's code raises anything else (a bug) | the run stops and the exception is raised as it is, with a note naming the class and the row; an answer `read` crashed on is kept, unread | not yet | fix it (or report it to the package's authors); run the same command again after the fix, which reads kept answers again with no call |
 | you stop the run (Ctrl-C, a closed laptop) | nothing is lost | not yet | run the same command again |
 | a judge doesn't answer for a row | grading says that row isn't scored | not yet | grade again (kept scores aren't paid for again) |
 | you grade while rows are "not yet" | grading refuses and names the rows | — | finish them, or grade with `partial=True` to count them 0 |
@@ -392,7 +402,7 @@ Each of these is optional, has a default, and is described in its class's docstr
 
 | you want | do this |
 | --- | --- |
-| a summary broken down by something the row holds (a language, a source) | return it from `Scorer.row_fields`, and group by it in `summarize` with `scorer.per(lines, "row.<field>", over)` |
+| a summary broken down by something the row holds (a language, a source) | return it from `Scorer.row_fields`, and group the lines by `line["row"][<field>]` in `summarize` |
 | a slow scorer, an LLM as a judge, or scoring on your own machines | see "How scoring runs" above |
 | to call a system with more or fewer rows at once | `workers=` on `run`; 0 means the adapter's own `workers` |
 | to run several systems at once, sharing one rate limit | run each in its own thread or process; to share a limit, give each run an `executor` factory that returns one shared pool |

@@ -65,11 +65,11 @@ class Run:
         run again. Grading doesn't need the system."""
         f = Path(folder)
         if not f.is_dir():
-            raise errors.UsageError(f"no folder at {f}; pass the folder holding predictions/<id>.json")
+            raise ValueError(f"no folder at {f}; pass the folder holding predictions/<id>.json")
         if not (f / "predictions").is_dir():
             hint = f"; pass its parent, {f.parent}" if f.name == "predictions" else ""
-            raise errors.UsageError(f"{f} has no predictions/ folder; a folder to grade holds "
-                                    f"predictions/<id>.json{hint}")
+            raise ValueError(f"{f} has no predictions/ folder; a folder to grade holds "
+                             f"predictions/<id>.json{hint}")
         return cls(f)
 
     @property
@@ -92,9 +92,9 @@ class Run:
         except FileNotFoundError:
             return {}
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise errors.UsageError(f"{path} isn't readable JSON ({exc}); fix it, or remove it") from None
+            raise ValueError(f"{path} isn't readable JSON ({exc}); fix it, or remove it") from None
         if not isinstance(said, dict):
-            raise errors.UsageError(f"{path} holds a JSON {type(said).__name__}; settings.json is an object")
+            raise ValueError(f"{path} holds a JSON {type(said).__name__}; settings.json is an object")
         return said
 
     def brought(self) -> bool:
@@ -115,8 +115,8 @@ class Run:
         said = self.settings()
         for key in ("dataset", "manifest", "task"):
             if (was := said.get(key)) and was != question[key]:
-                raise errors.UsageError(f"{self.folder} answers {key} {_spelled(was)}, not {_spelled(question[key])}: "
-                                        f"grade it with the {key} it was run on")
+                raise ValueError(f"{self.folder} answers {key} {_spelled(was)}, not {_spelled(question[key])}: "
+                                 f"grade it with the {key} it was run on")
 
     def prepare(self, question: Mapping[str, Any], commit: str | None, timeout: float) -> None:
         """Makes the run's folders, and writes its question, the dataset's commit and the timeout to

@@ -1,7 +1,7 @@
-"""The errors a user can meet, and the one rule that decides what each does:
+"""The two exceptions the core acts on, and the one rule that decides what an exception does:
 
     A row counts 0 only when code says, on purpose, that the system failed, by raising `SystemFailed`.
-    Any other exception stops the run and prints its traceback.
+    Any other exception stops the run and is raised as it is.
 
 So:
 
@@ -9,19 +9,19 @@ So:
   one row. The row's record keeps it, with its traceback, and the row counts 0; the run goes on. A transient
   one (a 429, a 5xx) is retried first;
 - `Unscored`: a scorer couldn't score one row for a reason that isn't the system's (a judge that didn't
-  answer). Grading isn't finished until a later grading scores it;
-- `UsageError`: what was asked is wrong (an option, a dataset, a file). `Unfinished` is one: a run graded
-  before every row has an answer and a score;
-- `Stop`: the run can't go on for any row (an account, a key, a server, a missing dependency); and
-- `Bug`: any other exception, which is a bug in the code that raised it. The message says whose code it is,
-  where to report it, and has the whole traceback.
+  answer). Grading isn't finished until a later grading scores it; and
+- anything else is a native exception, raised as it is with its own traceback: a `ValueError` for what was
+  asked wrong (an option, a dataset, a missing key, a run graded before it is finished), a `PermissionError`
+  for an account that can't pay, an `ImportError` for a missing package, a refused connection as the
+  connection error it is, and a bug in an adapter or a scorer as whatever it raised. The core adds a note
+  saying where (`noted`): which class, and which row.
 
 A stop of any kind keeps every answer that was paid for, so running the same command again after the fix
 costs nothing for the rows already done.
 
 This module also has helpers: `counted` writes a count in a message, `capped` cuts a message written to a
-file, `check_dataclass` refuses an adapter, scorer or task that forgot its dataclass decorator, and `package`
-and `bug` say whose code a class is.
+file, `check_dataclass` refuses an adapter, scorer or task that forgot its dataclass decorator, `package` says
+which installed package a class comes from, and `noted` adds where an exception was raised.
 """
 
 from __future__ import annotations
@@ -36,64 +36,11 @@ TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 523, 524
 CAP = 4000   # the most characters of a message or traceback written to a file
 
 
-class UsageError(ValueError):
-    """What was asked is wrong. The message says what was wrong, the value given, and how to fix it."""
-
-
-class Unfinished(UsageError):
-    """A run graded before it is finished: some of its rows have no answer yet, or no score yet.
-
-    Grading refuses it, because a headline over part of the rows can't be told apart from one over all of
-    them. The message lists the rows, and the two ways on: finish them, or grade with `partial`, which counts
-    them as failed."""
-
-
-class Stop(Exception):
-    """The run can't go on, for a reason that is the same for every row.
-
-    It is raised, never recorded: recorded, it would look like an answer for one row, and a resumed run
-    would never try that row again."""
-
-
 class Unscored(Exception):
     """A scorer couldn't score a row, for a reason that isn't the system's fault, such as a judge that
     didn't answer.
 
     The row counts as neither scored nor failed, so grading isn't finished until a later grading scores it."""
-
-
-class AccountFailure(Stop):
-    """The account can't pay.
-
-    It stops the run instead of failing each row. One vendor once marked 174 documents as failed in 60
-    seconds after hitting a credit limit, which turned a pause we could recover from into 174 zeros."""
-
-
-class MissingCredential(Stop):
-    """A system's API key is not set in the environment."""
-
-
-class MissingDependency(ImportError, Stop):
-    """An adapter could not import a package it needs."""
-
-
-class Unread(Exception):
-    """`Adapter.read` raised something other than `SystemFailed`: a bug in `read`. It carries the row's record,
-    with the system's raw answer and no output, so the answer is saved before the run stops; running the same
-    command again reads it again with the fixed `read`, with no call."""
-
-    def __init__(self, record: dict[str, Any]):
-        super().__init__(record)   # Note: the record is its one argument, so it survives being sent between processes
-        self.record = record
-
-    def __str__(self) -> str:
-        return "read raised; the answer is kept unread"
-
-
-class Bug(Stop):
-    """An adapter or a scorer raised something that is neither an answer nor a failure we know of: a bug in
-    its code, not a failure of the system. The message says whose code it is and where its traceback was
-    saved (`bug`)."""
 
 
 class SystemFailed(RuntimeError):
@@ -223,27 +170,8 @@ def refused(exc: BaseException) -> bool:
     return False
 
 
-def bug(what: str, exc: BaseException, cls: type) -> Bug:
-    """The `Bug` to raise when `cls`'s code raised `exc` while doing `what` ("predicting doc_17"). Its message
-    says whose code it is (an installed package's, with where to report it, or your own class's, with its
-    file), the versions a report needs, and the whole traceback."""
-    import importlib.metadata
-    import inspect
-    import platform
-    import traceback
-
-    head = f"{cls.__name__} raised {type(exc).__name__} while {what}: {exc}"
-    if (p := package(cls)) is not None:
-        name, version, home = p
-        where = f"report it at {home}/issues" if home else f"report it to {name}'s authors"
-        body = f"this is a bug in {name} {version}, not a failure of the system; {where}, with this message"
-    else:
-        try:
-            file = inspect.getfile(cls)
-        except TypeError:
-            file = cls.__module__
-        body = f"this is a bug in your {cls.__name__} ({file}), not a failure of the system"
-    versions = (f"omni-bench-core {importlib.metadata.version('omni-bench-core')}, "
-                f"Python {platform.python_version()}")
-    tb = "".join(traceback.format_exception(exc)).rstrip()
-    return Bug(f"{head}\n{body}. Run the same command again after a fix.\n({versions})\n{tb}")
+def noted[E: BaseException](exc: E, cls: type, what: str) -> E:
+    """`exc`, to be raised again as it is, with a note: which class's code raised it, and while doing `what`
+    ("reading the answer of doc_17")."""
+    exc.add_note(f"{cls.__name__} raised this while {what}")
+    return exc

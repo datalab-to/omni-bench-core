@@ -122,7 +122,7 @@ class Adapter[I]:
 
     `predict` holds the rules every call follows, so no adapter writes them again: one time budget per row,
     transient failures retried, a failure that is an answer recorded, and a failure that is the same for
-    every row (`errors.Stop`) raised.
+    every row (an account that can't pay, a refused connection) raised.
 
     An adapter is called for one row at a time. To use a model that runs many rows at once, serve it, and
     have its adapter call the server. The run and the server can share one machine.
@@ -270,21 +270,21 @@ def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
     fields = [f.name for f in dataclasses.fields(cls)]
     if unknown := sorted(set(options) - set(fields)):
         near = difflib.get_close_matches(unknown[0], fields, n=1)
-        raise errors.UsageError(f"{cls.name} has no option {unknown[0]!r}"
-                                + (f" (did you mean {near[0]!r}?)" if near else "")
-                                + f"; its options are: {', '.join(fields) or '(none)'}")
+        raise ValueError(f"{cls.name} has no option {unknown[0]!r}"
+                         + (f" (did you mean {near[0]!r}?)" if near else "")
+                         + f"; its options are: {', '.join(fields) or '(none)'}")
     hints = typing.get_type_hints(cls)
     for k, v in options.items():
         try:
             json.dumps(v, allow_nan=False, default=str)
         except ValueError:
-            raise errors.UsageError(f"{cls.name}: option {k} is {v!r}; give a finite number") from None
+            raise ValueError(f"{cls.name}: option {k} is {v!r}; give a finite number") from None
         t = hints.get(k)
         if t not in (str, int, float, bool): continue
         if t is float and isinstance(v, int) and not isinstance(v, bool):
             options[k] = float(v)
         elif not isinstance(v, t) or (t is not bool and isinstance(v, bool)):
-            raise errors.UsageError(f"{cls.name}: option {k} is {v!r}, a {type(v).__name__}; it takes a {t.__name__}")
+            raise ValueError(f"{cls.name}: option {k} is {v!r}, a {type(v).__name__}; it takes a {t.__name__}")
     return cls(**options)
 
 
@@ -296,10 +296,10 @@ def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict
     - `SystemFailed` is the row's answer: recorded as `error`, with its traceback, and counted 0. A transient
       one (a 429, a 5xx) is retried first, up to `a.retries` times, within the row's budget. An answer that
       arrives after the budget is a timeout, so every system gets the same time;
-    - a 401, a 402 or an account phrase (`Adapter.account_failure`) is raised as `AccountFailure`, and a
-      refused connection as a `Stop`: they would be the same for every row; and
-    - anything else is raised: a bug. When `read` raised it, it comes as `errors.Unread`, carrying the record,
-      so the paid answer is saved before the run stops.
+    - a 401, a 402 or an account phrase (`Adapter.account_failure`) is raised as a `PermissionError`, and a
+      refused connection is raised as it is, with a note: they would be the same for every row; and
+    - anything else is raised as it is: a bug. When `read` raised it, the exception carries the record as
+      `unread`, so the paid answer is saved before the run stops.
 
     The record holds `system`, `options`, `package` (the adapter's package and version, so answers from two
     versions of an adapter can be told apart), `output` (None on a failure), `raw`, `sent`, `error` (its type,
@@ -318,17 +318,17 @@ def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict
                 raise TypeError(f"{type(a).__name__}.call must return an adapter.Call, not a {type(got).__name__}")
             error = None
             break
-        except errors.Stop:
-            raise
         except Exception as exc:
             if errors.refused(exc):
-                raise errors.Stop(f"{a.label} couldn't connect: the connection was refused ({exc}). If it calls a "
-                                  "server you run, start it (or pass its base_url), then run the same command "
-                                  "again") from exc
+                # Note: an adapter that knows its server says how to start it; ours is only the fallback.
+                if not getattr(exc, "__notes__", None):
+                    exc.add_note(f"{a.label} couldn't connect: the connection was refused. If it calls a server you "
+                                 "run, start it (or pass its base_url), then run the same command again")
+                raise
             if not isinstance(exc, errors.SystemFailed): raise
             if a.account_failure(exc):
-                raise errors.AccountFailure(f"{a.label}: {exc}; fix the account (its key, its credits), then run the "
-                                            "same command again") from exc
+                raise PermissionError(f"{a.label}: {exc}; fix the account (its key, its credits), then run the same "
+                                      "command again") from exc
             if isinstance(exc.cost, Cost): spent.append(exc.cost)
             error = exc
             if not exc.transient or attempt == a.retries: break
@@ -371,7 +371,7 @@ def reread[I](a: Adapter[I], x: I, rec: dict[str, Any]) -> dict[str, Any]:
     unchanged, because it has no answer to read.
 
     `read` raising `SystemFailed` records the answer as `Unreadable`, which counts 0 and keeps the raw answer.
-    Anything else it raises is a bug in `read`: it is raised as `errors.Unread`, carrying the record with the
+    Anything else it raises is a bug in `read`: it is raised as it is, carrying as `unread` the record with the
     raw answer and no output, so the answer is saved before the run stops."""
     if rec["error"] is not None and rec["error"]["type"] != "Unreadable":
         return rec
@@ -382,10 +382,9 @@ def reread[I](a: Adapter[I], x: I, rec: dict[str, Any]) -> dict[str, Any]:
         e = errors.Unreadable(f"{type(exc).__name__}: {exc}" if type(exc) is not errors.SystemFailed else str(exc))
         e.__cause__ = exc
         return rec | {"output": None, "error": _failure(e)}
-    except errors.Stop:
-        raise
     except Exception as exc:
-        raise errors.Unread(rec | {"output": None, "error": None, "unread": True}) from exc
+        exc.unread = rec | {"output": None, "error": None, "unread": True}
+        raise
 
 
 def _failure(e: errors.SystemFailed) -> dict[str, Any]:
