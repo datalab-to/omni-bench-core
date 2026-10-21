@@ -1252,6 +1252,19 @@ def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -
     assert config.apply(dotted, ["system.org/model-1.5.x.y=2"]) == {"system": {"org/model-1.5": {"x": {"y": 2}}}}
 
 
+def test_a_folder_names_its_commit_and_a_resume_refuses_another(tmp: Path) -> None:
+    d = dataset(tmp / "data")
+    first = bench(d).run(GoldEcho(), tmp / "runs")["run"]
+    assert "dataset_commit" not in json.loads((tmp / "runs" / first / "settings.json").read_text())   # no COMMIT
+    (d / data.COMMIT).write_text("abc123\n")
+    b = bench(d)
+    one = b.run(GoldEcho(), tmp / "runs")["run"]
+    assert json.loads((tmp / "runs" / one / "settings.json").read_text())["dataset_commit"] == "abc123"
+    (d / data.COMMIT).write_text("def456")
+    refused(b.run, GoldEcho(), tmp / "runs", resume=one, match="at commit abc123, and it is now at def456")
+    (d / data.COMMIT).write_text("two words")
+    refused(data.commit, d, d, match="one commit on one line")
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):
