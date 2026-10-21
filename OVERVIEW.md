@@ -194,6 +194,11 @@ Another question uses another folder: `sample=20` and the full dataset are two r
 answer is paid for twice. The timeout isn't part of the question: running again with a longer one (and
 `retry_failed`) gives timed-out rows more time in the same folder.
 
+The question names the dataset by its address (a folder, or `hf://...`). When one dataset is read from several
+places, such as a Hugging Face address on one machine and a local copy on another, give the `Benchmark` a
+`dataset_name`: the question then names the dataset by it, so a run is the same question, and resumes the same
+folder, wherever the data is read from.
+
 ### Scorer
 
 A scorer is one way of grading: a frozen dataclass whose fields are its options. You write:

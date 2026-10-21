@@ -943,6 +943,15 @@ def test_progress_lines_say_failed_and_cost(tmp: Path) -> None:
     assert last and last[0].endswith("; 1 failed, $1.00"), said     # c1 is refused; four answers at $0.25
 
 
+def test_a_dataset_name_makes_one_question_wherever_the_data_is_read(tmp: Path) -> None:
+    here, there = dataset(tmp / "here"), dataset(tmp / "there")      # one dataset, read from two places
+    named = [benchmark.Benchmark(Copying(), d, [Exact()], dataset_name="texts") for d in (here, there)]
+    assert len({runs.folder_name(Copy(), b.question()) for b in named}) == 1
+    assert named[0].question()["dataset"] == "texts"
+    assert bench(here).question()["dataset"] != bench(there).question()["dataset"]     # without it, the address
+    refused(benchmark.Benchmark, Copying(), here, [Exact()], dataset_name=" ", match="dataset_name is ' '")
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):

@@ -59,14 +59,21 @@ class Benchmark:
         run       plan, then predict, then grade;
         reread    reads a run's saved answers again after a fix to `read`, with no call; and
         check     checks the dataset with no call.
+
+    `dataset_name`, when given, names the dataset in a run's question instead of `dataset`'s address. Give it
+    when one dataset is read from more than one place (a Hugging Face address, a local copy, a copy on another
+    machine), so a run of it is the same question, and resumes, wherever it is read from.
     """
 
     task: task.Task
     dataset: str | Path
     scorers: Sequence[scorer.Scorer]
     manifest: str = data.MANIFEST
+    dataset_name: str | None = None
 
     def __post_init__(self) -> None:
+        if self.dataset_name is not None and not (isinstance(self.dataset_name, str) and self.dataset_name.strip()):
+            raise ValueError(f"dataset_name is {self.dataset_name!r}; give the dataset's name, a non-empty string")
         errors.check_dataclass(type(self.task), task.Task)
         for s in self.scorers:
             errors.check_dataclass(type(s), scorer.Scorer)
@@ -87,8 +94,9 @@ class Benchmark:
 
     def question(self, selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """What a run answers besides its system: the dataset, manifest, task and choice of rows."""
-        return {"dataset": data.dataset_id(self.dataset), "manifest": data.manifest_path(self.manifest),
-                "task": self.task.identity(), "rows": dict(selection or {})}
+        return {"dataset": self.dataset_name or data.dataset_id(self.dataset),
+                "manifest": data.manifest_path(self.manifest), "task": self.task.identity(),
+                "rows": dict(selection or {})}
 
     def plan(self, system: adapter.Adapter, out: str | Path, *, limit: int = 0, sample: int = 0,
              only: Iterable[str] | None = None,
