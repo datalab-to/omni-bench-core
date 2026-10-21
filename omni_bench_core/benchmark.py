@@ -192,8 +192,7 @@ class Benchmark:
         for name, s in graded.items():
             n = (p := s.get("partial", {})) and p["no_answer"] + p["not_scored"]
             part = f", PARTIAL: {n} unfinished rows counted 0, each a failed line in scores.jsonl" if n else ""
-            log.info("%s %s: headline %s; %s, %d failed%s%s", r.name, name, _headline(s),
-                     errors.counted(s["rows"], "row"), s["failed"], spent, part)
+            log.info("%s %s: headline %s; %d failed%s%s", r.name, name, _headline(s), s["failed"], spent, part)
         return {"run": r.name, "cost": cost, "scorers": graded}
 
     def run(self, system: adapter.Adapter, out: str | Path, *,
@@ -253,9 +252,11 @@ class Benchmark:
 
 def _headline(s: dict[str, Any]) -> str:
     """A summary's headline as the log line shows it: the scorer's number over the scored rows times coverage."""
-    if s["scored"] is None: return f"{s['headline']:.3f}: no row was scored"
-    sc, n = s["scored"], errors.counted(s["rows"] - s["failed"], "scored row")
-    return f"{s['headline']:.3f} = {sc['headline']:.3f} ({sc['headline_is']}) on {n} × coverage {s['coverage']:.3f}"
+    # Note: coverage as a count, since a share rounds 7665/7667 to 1.000; four decimals so the product checks.
+    if s["scored"] is None: return f"{s['headline']:.4f}: none of the {s['rows']} rows was scored"
+    sc = s["scored"]
+    return (f"{s['headline']:.4f} = {sc['headline']:.4f} ({sc['headline_is']}) × coverage "
+            f"{s['rows'] - s['failed']}/{s['rows']}")
 
 
 def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: float) -> dict[str, Any]:

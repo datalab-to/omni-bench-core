@@ -218,7 +218,7 @@ def test_resume_calls_nothing(tmp: Path) -> None:
     assert CALLS == [], CALLS
     assert any("all 6 rows done in an earlier run; nothing to predict" in m for m in said), said
     # the log line splits the headline into the score over the scored rows and coverage
-    assert any("headline 0.833 = 1.000 (" in m and ") on 5 scored rows × coverage 0.833;" in m for m in said), said
+    assert any("headline 0.8333 = 1.0000 (" in m and ") × coverage 5/6; 1 failed" in m for m in said), said
     s = g["scorers"]["exact"]
     assert s["failed"] == 1 and abs(s["coverage"] - 5 / 6) < 1e-9
     assert abs(s["headline"] - 5 / 6) < 1e-9, s     # a refused row counts as 0
