@@ -124,7 +124,7 @@ class Adapter[I](abc.ABC):
     def read(self, raw: Any, x: I) -> Any:
         """The output in a raw answer: what predictions/<id>.json holds and every scorer reads. Raise
         `errors.SystemFailed` for an unusable answer (the row counts 0). Anything else is a bug: the run stops,
-        the answer is kept, and the same command after the fix reads it again with no call."""
+        the answer is kept, and resuming the run after the fix reads it again with no call."""
         return raw
 
     @property
@@ -277,12 +277,12 @@ def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict
                 # Note: an adapter that knows its server says how to start it; ours is only the fallback.
                 if not getattr(exc, "__notes__", None):
                     exc.add_note(f"{a.label} couldn't connect: the connection was refused. If it calls a server you "
-                                 "run, start it (or pass its base_url), then run the same command again")
+                                 "run, start it (or pass its base_url), then resume the run")
                 raise
             if not isinstance(exc, errors.SystemFailed): raise
             if a.account_failure(exc):
-                raise PermissionError(f"{a.label}: {exc}; fix the account (its key, its credits), then run the same "
-                                      "command again") from exc
+                raise PermissionError(f"{a.label}: {exc}; fix the account (its key, its credits), then resume the "
+                                      "run") from exc
             if isinstance(exc.cost, Cost): spent.append(exc.cost)
             error = exc
             if not exc.transient or attempt == a.retries: break

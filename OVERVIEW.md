@@ -165,7 +165,7 @@ A row counts 0 only when you say the system failed:
   with its traceback, and a transient status is retried first; and
 - anything else stops the run, raised as it is with a note naming the adapter and the row. Use a native
   exception whose message says what to fix. Declare `keys`, and a missing key is refused before any call. If
-  `read` raised it, the answer is kept, and the same command after the fix reads it with no call.
+  `read` raised it, the answer is kept, and resuming the run after the fix reads it with no call.
 
 ### Run
 
@@ -189,15 +189,21 @@ Everything in a run folder is plain JSON: dicts, lists, strings, finite numbers,
 option, a raw answer, `read`'s output, a scorer's result and a summary must be plain JSON too, and the core
 refuses anything else (a `TypeError` naming what it was), rather than writing its `str()`.
 
-Another question uses another folder: `sample=20` and the full dataset are two runs, as are `sample=6` and
-`limit=6`. The same question resumes the same folder, skipping every row that already has a record, so no
-answer is paid for twice. The timeout isn't part of the question: running again with a longer one (and
+Every launch is a new run in a new folder, named after its question and a run id:
+`<label>-<digest>-<YYYYMMDD-HHMMSS>-<4 hex>`. The digest is of the system, its options and the question, so
+runs of one question sort together. `plan(..., resume=<a run's name>)` continues that run instead, skipping
+every row that already has a record, so no answer is paid for twice; it refuses a run of another question
+(`sample=20` and the full dataset are two questions, as are `sample=6` and `limit=6`). A new run is never mixed
+with an old one: a hosted system redeployed since, or two launches at once, each get their own folder.
+
+settings.json keeps the launch: `started` (UTC) and `launch`, whatever the caller records there (who launched
+it, the commit of their code). The timeout isn't part of the question: resuming with a longer one (and
 `retry_failed`) gives timed-out rows more time in the same folder.
 
 The question names the dataset by its address (a folder, or `hf://...`). When one dataset is read from several
 places, such as a Hugging Face address on one machine and a local copy on another, give the `Benchmark` a
-`dataset_name`: the question then names the dataset by it, so a run is the same question, and resumes the same
-folder, wherever the data is read from.
+`dataset_name`: the question then names the dataset by it, so a run is the same question, and can be resumed,
+wherever the data is read from.
 
 ### Scorer
 
@@ -358,11 +364,11 @@ Three rules decide every case. They live in the parts you don't write, so a new 
 them:
 
 1. a run folder answers one exact question: the system and its options, the dataset, manifest and task, and
-   which rows. Another question gets another folder; the same question resumes;
+   which rows. Every launch is a new run in its own folder; `resume` continues a run, of the same question only;
 2. grading reports only a finished run: every row answered or failed, and scored. Otherwise it refuses and
    names the rows; `partial=True` (`--partial`) counts them failed, and the summary says how many; and
 3. a row counts 0 only when code raises `errors.SystemFailed` on purpose. Any other exception stops the run and
-   is raised as it is; every answer already paid for is kept, so the same command after the fix resumes.
+   is raised as it is; every answer already paid for is kept, so resuming the run after the fix pays only for the rest.
 
 What that means, case by case:
 
@@ -370,11 +376,11 @@ What that means, case by case:
 | --- | --- | --- | --- |
 | the system answers | the run goes on | its score | nothing |
 | the system refuses, errors or answers something unusable (the adapter raises `SystemFailed`, or `reading()` does) | the row is recorded as failed, with the traceback of where it was raised, and the run goes on | 0 | nothing; its error is in `scores.jsonl` and `records/<id>.json` |
-| the system times out, or keeps answering 429 or 5xx | the row is recorded as failed, and the run goes on; an answer that comes after the timeout counts as a timeout | 0 | optionally run again with `retry_failed=True` (`--retry-failed`) |
-| your key is missing or wrong, or your account is out of credits | the run stops and says why; a missing key stops it before any call | not yet | fix it, then run the same command again |
-| a model server you host isn't running | the run stops and says so | not yet | start it, then run the same command again |
-| an adapter's or a scorer's code raises anything else (a bug) | the run stops and the exception is raised as it is, with a note naming the class and the row; an answer `read` crashed on is kept, unread | not yet | fix it (or report it to the package's authors); run the same command again after the fix, which reads kept answers again with no call |
-| you stop the run (Ctrl-C, a closed laptop) | nothing is lost | not yet | run the same command again |
+| the system times out, or keeps answering 429 or 5xx | the row is recorded as failed, and the run goes on; an answer that comes after the timeout counts as a timeout | 0 | optionally resume it with `retry_failed=True` |
+| your key is missing or wrong, or your account is out of credits | the run stops and says why; a missing key stops it before any call | not yet | fix it, then resume the run |
+| a model server you host isn't running | the run stops and says so | not yet | start it, then resume the run |
+| an adapter's or a scorer's code raises anything else (a bug) | the run stops and the exception is raised as it is, with a note naming the class and the row; an answer `read` crashed on is kept, unread | not yet | fix it (or report it to the package's authors); resume the run after the fix, which reads kept answers again with no call |
+| you stop the run (Ctrl-C, a closed laptop) | nothing is lost | not yet | resume the run |
 | a judge doesn't answer for a row | grading says that row isn't scored | not yet | grade again (kept scores aren't paid for again) |
 | you grade while rows are "not yet" | grading refuses and names the rows | — | finish them, or grade with `partial=True` to count them 0 |
 | you change the system, options, dataset, manifest or rows | a new run folder is used | — | nothing; the old folder is untouched |

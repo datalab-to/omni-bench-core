@@ -203,7 +203,7 @@ def test_gold_echo_scores_one(tmp: Path) -> None:
 def test_resume_calls_nothing(tmp: Path) -> None:
     b = bench(dataset(tmp / "d", {**TEXTS, "f1": ("other", "flaky")}))
     CALLS.clear()
-    b.run(Copy(), tmp / "runs")
+    name = b.run(Copy(), tmp / "runs")["run"]
     assert CALLS.count("f1") == 2, CALLS          # a 503 is retried within the row
     CALLS.clear()
     said: list[str] = []
@@ -212,10 +212,10 @@ def test_resume_calls_nothing(tmp: Path) -> None:
     logging.getLogger("omni_bench_core").addHandler(handler)
     logging.getLogger("omni_bench_core").setLevel(logging.INFO)
     try:
-        g = b.run(Copy(), tmp / "runs")
+        g = b.run(Copy(), tmp / "runs", resume=name)
     finally:
         logging.getLogger("omni_bench_core").removeHandler(handler)
-    assert CALLS == [], CALLS
+    assert CALLS == [] and g["run"] == name, CALLS
     assert any("all 6 rows done in an earlier run; nothing to predict" in m for m in said), said
     # the log line splits the headline into the score over the scored rows and coverage
     assert any("headline 0.8333 = 1.0000 (" in m and ") × coverage 5/6; 1 failed" in m for m in said), said
@@ -223,6 +223,26 @@ def test_resume_calls_nothing(tmp: Path) -> None:
     assert s["failed"] == 1 and abs(s["coverage"] - 5 / 6) < 1e-9
     assert abs(s["headline"] - 5 / 6) < 1e-9, s     # a refused row counts as 0
     assert g["cost"]["usd"] == 1.25
+
+
+def test_each_launch_is_a_new_run_and_resume_continues_only_the_same_question(tmp: Path) -> None:
+    b = bench(dataset(tmp / "d"))
+    one = b.run(GoldEcho(), tmp / "runs", launch={"by": "me", "commit": "abc"})["run"]
+    two = b.run(GoldEcho(), tmp / "runs")["run"]
+    stem = runs.stem(GoldEcho(), b.question())
+    assert one != two and one.startswith(stem + "-") and two.startswith(stem + "-"), (one, two)
+    said = json.loads((tmp / "runs" / one / "settings.json").read_text())
+    assert said["launch"] == {"by": "me", "commit": "abc"} and said["started"].endswith("+00:00"), said
+    CALLS.clear()
+    assert b.run(GoldEcho(), tmp / "runs", resume=one, launch={"by": "you"})["run"] == one and CALLS == []
+    # a resumed run keeps its first launch's record
+    assert json.loads((tmp / "runs" / one / "settings.json").read_text())["launch"]["by"] == "me"
+    refused(b.plan, GoldEcho(), tmp / "runs", sample=2, resume=one, match="it differs in rows")
+    refused(b.plan, Copy(), tmp / "runs", resume=one, match="it differs in system, options")
+    refused(b.plan, GoldEcho(), tmp / "runs", resume="nope", match="no run nope under")
+    refused(b.plan, GoldEcho(), tmp / "runs", resume=f"runs/{one}", match="last part of its folder")
+    refused(b.plan, GoldEcho(), tmp / "runs", retry_failed=True, match="name the run with resume")
+    refused(b.plan, GoldEcho(), tmp / "runs", launch={"at": object()}, match="launch")
 
 
 def test_a_choice_of_rows_is_its_own_finished_run(tmp: Path) -> None:
@@ -283,7 +303,7 @@ def test_restore_from_record(tmp: Path) -> None:
     name = b.run(GoldEcho(), tmp / "runs")["run"]
     (tmp / "runs" / name / "predictions" / "a1.json").unlink()
     CALLS.clear()
-    g = b.run(GoldEcho(), tmp / "runs")
+    g = b.run(GoldEcho(), tmp / "runs", resume=name)
     assert CALLS == [] and g["scorers"]["exact"]["headline"] == 1.0
     assert (tmp / "runs" / name / "predictions" / "a1.json").exists()
 
@@ -319,9 +339,9 @@ def test_refused_before_any_call(tmp: Path) -> None:
     refused(adapter.configure, Exact, {"strict": True}, match="exact has no option 'strict'")
     refused(adapter.configure, Doc, {}, match="an adapter or a scorer")
     q = b.question()
-    name = functools.partial(runs.folder_name, question=q)
+    name = functools.partial(runs.stem, question=q)
     assert name(Copy()) == name(Copy(temperature=0.0)) != name(Copy(upper=True))
-    assert runs.folder_name(Copy(), q) != runs.folder_name(Copy(), b.question({"sample": 2}))
+    assert runs.stem(Copy(), q) != runs.stem(Copy(), b.question({"sample": 2}))
     refused(b.plan, [Copy()], tmp / "runs", match="not one adapter instance")
     refused(b.plan, GoldEcho(), tmp / "runs", workers=-1, match="workers is -1")
     refused(benchmark.Benchmark, Copying(), tmp / "ok", (), match="at least one scorer")
@@ -577,7 +597,7 @@ class CopyingTwice(Copying):
 def test_another_task_is_another_folder(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"))
     other = benchmark.Benchmark(CopyingTwice(), tmp / "d", [Exact()])
-    assert b.plan(GoldEcho(), tmp / "runs").run.name != other.plan(GoldEcho(), tmp / "runs").run.name
+    assert runs.stem(GoldEcho(), b.question()) != runs.stem(GoldEcho(), other.question())
     name = b.run(GoldEcho(), tmp / "runs")["run"]
     refused(other.grade, tmp / "runs" / name, match="answers task")
     assert json.loads((tmp / "runs" / name / "settings.json").read_text())["task"] == {"name": "copying", "options": {}}
@@ -678,22 +698,22 @@ def test_a_refused_connection_stops_the_run(tmp: Path) -> None:
 
 def test_a_selection_of_every_row_is_every_row(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"))
-    every = b.plan(GoldEcho(), tmp / "runs").run
-    limited = b.plan(GoldEcho(), tmp / "runs", limit=100).run
-    sampled = b.plan(GoldEcho(), tmp / "runs", sample=2).run
-    assert every.name == limited.name != sampled.name
+    every = b.plan(GoldEcho(), tmp / "runs").question
+    limited = b.plan(GoldEcho(), tmp / "runs", limit=100).question
+    sampled = b.plan(GoldEcho(), tmp / "runs", sample=2).question
+    assert every == limited != sampled
 
 
 def test_a_scorer_bug_names_its_row(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"), Crashes())
-    name = b.plan(GoldEcho(), tmp / "runs").run.name
     try:
         b.run(GoldEcho(), tmp / "runs")
     except KeyError as exc:      # the scorer's own exception, with a note saying where
         assert exc.__notes__ == ["Crashes raised this while scoring a2"], exc.__notes__
     else:
         raise AssertionError("a bug in a scorer was not raised")
-    assert not (tmp / "runs" / name / "crashes" / "summary.json").exists()
+    [folder] = (tmp / "runs").iterdir()
+    assert not (folder / "crashes" / "summary.json").exists()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -757,7 +777,7 @@ def test_a_bug_in_read_stops_keeps_the_answer_and_a_rerun_reads_it(tmp: Path) ->
     assert not (folder / "predictions" / "a2.json").exists()
     refused(b.grade, folder, match="3 rows never predicted, or answered but not yet read: a2, b1, b2")
     CALLS.clear()
-    g = b.run(ReadsRight(), tmp / "runs")                    # the fix, then the same command: no call for a2
+    g = b.run(ReadsRight(), tmp / "runs", resume=folder.name)     # the fix, then resume: no call for a2
     assert g["run"] == folder.name and "a2" not in CALLS and g["scorers"]["exact"]["headline"] == 1.0, (CALLS, g)
 
 
@@ -946,7 +966,7 @@ def test_progress_lines_say_failed_and_cost(tmp: Path) -> None:
 def test_a_dataset_name_makes_one_question_wherever_the_data_is_read(tmp: Path) -> None:
     here, there = dataset(tmp / "here"), dataset(tmp / "there")      # one dataset, read from two places
     named = [benchmark.Benchmark(Copying(), d, [Exact()], dataset_name="texts") for d in (here, there)]
-    assert len({runs.folder_name(Copy(), b.question()) for b in named}) == 1
+    assert len({runs.stem(Copy(), b.question()) for b in named}) == 1
     assert named[0].question()["dataset"] == "texts"
     assert bench(here).question()["dataset"] != bench(there).question()["dataset"]     # without it, the address
     refused(benchmark.Benchmark, Copying(), here, [Exact()], dataset_name=" ", match="dataset_name is ' '")

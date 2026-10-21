@@ -30,6 +30,7 @@ class Plan(NamedTuple):
     timeout: float
     workers: int                     # rows in flight at once
     retry_failed: bool
+    launch: Mapping[str, Any]        # the caller's record of the launch, kept in settings.json
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,8 +45,9 @@ class Benchmark:
     and can be repeated. Three rules decide every case:
 
     1. a run folder answers one exact question: the system and its options, the dataset, manifest and task,
-       and the choice of rows (`sample`, `limit`, `only`). Another question gets another folder, and the same
-       question resumes;
+       and the choice of rows (`sample`, `limit`, `only`). Every launch is a new run in a new folder, named
+       after its question and a run id; a launch that names a run (`resume`) continues it, and only for the
+       same question;
     2. grading reports only a finished run (every row answered or failed, and scored); otherwise it refuses
        and names the rows, and `partial=True` counts them 0; and
     3. a row counts 0 only when code raises `SystemFailed`. Any other exception stops the run and is raised as
@@ -53,8 +55,9 @@ class Benchmark:
 
     Methods:
 
-        plan      the run, checked before any call (options, keys, rows, input files and golds);
-        predict   sends the rows the run has no record of; a stopped run resumes;
+        plan      a new run, or the run to resume, checked before any call (options, keys, rows, input files
+                  and golds);
+        predict   sends the rows the run has no record of;
         grade     each scorer on a finished run;
         run       plan, then predict, then grade;
         reread    reads a run's saved answers again after a fix to `read`, with no call; and
@@ -62,7 +65,7 @@ class Benchmark:
 
     `dataset_name`, when given, names the dataset in a run's question instead of `dataset`'s address. Give it
     when one dataset is read from more than one place (a Hugging Face address, a local copy, a copy on another
-    machine), so a run of it is the same question, and resumes, wherever it is read from.
+    machine), so a run of it is the same question, and can be resumed, wherever it is read from.
     """
 
     task: task.Task
@@ -99,15 +102,20 @@ class Benchmark:
                 "rows": dict(selection or {})}
 
     def plan(self, system: adapter.Adapter, out: str | Path, *, limit: int = 0, sample: int = 0,
-             only: Iterable[str] | None = None,
-             timeout: float = adapter.DEFAULT_TIMEOUT, workers: int = 0, retry_failed: bool = False) -> Plan:
-        """The run of `system`, in its own folder under `out`, checked before any call.
+             only: Iterable[str] | None = None, timeout: float = adapter.DEFAULT_TIMEOUT, workers: int = 0,
+             resume: str | None = None, retry_failed: bool = False,
+             launch: Mapping[str, Any] | None = None) -> Plan:
+        """A new run of `system` in a new folder under `out`, or the run `resume` names there; checked before any
+        call.
 
         Args:
           only, sample, limit: choose the rows (`data.select`); part of the run's question.
           timeout: the seconds each row may take.
           workers: rows in flight at once; 0 for the system's own `Adapter.workers`.
-          retry_failed: predict again the rows whose recorded failure may not recur.
+          resume: the name of a run under `out` to continue; it must answer the same question.
+          retry_failed: with `resume`, predict again the rows whose recorded failure may not recur.
+          launch: the caller's record of this launch (who, from which commit), plain JSON, kept in a new run's
+            settings.json.
         """
         if not isinstance(system, adapter.Adapter):
             raise TypeError(f"{system!r} is not one adapter instance; make one, e.g. Datalab(mode='accurate'). A run "
@@ -116,6 +124,10 @@ class Benchmark:
             raise ValueError(f"timeout is {timeout}; give the seconds a row may take, a positive number")
         if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
             raise ValueError(f"workers is {workers!r}; give a whole number, or 0 for the system's own")
+        if retry_failed and resume is None:
+            raise ValueError("retry_failed predicts a run's failed rows again; name the run with resume=<its name>")
+        launch = dict(launch or {})
+        errors.plain(launch, "launch")
         adapter.check_keys(system)
         every = self.rows()
         selection = data.selection(limit, sample, only)
@@ -125,8 +137,25 @@ class Benchmark:
         q = self.question(selection)
         self._inputs(chosen)
         for s in self.scorers: s.check_gold(every)
-        return Plan(runs.Run(Path(out) / runs.folder_name(system, q), system), q, chosen, timeout,
-                    workers or type(system).workers, retry_failed)
+        folder = Path(out) / (self._resumed(system, q, Path(out), resume) if resume is not None
+                              else runs.folder_name(system, q, runs.new_id()))
+        return Plan(runs.Run(folder, system), q, chosen, timeout, workers or type(system).workers, retry_failed,
+                    launch)
+
+    def _resumed(self, system: adapter.Adapter, q: Mapping[str, Any], out: Path, resume: str) -> str:
+        """The name of the run to resume, checked: a folder under `out` that a launch of this same question made."""
+        if not isinstance(resume, str) or not resume or "/" in resume or "\\" in resume:
+            raise ValueError(f"resume is {resume!r}; give a run's name, the last part of its folder")
+        if not (out / resume / "settings.json").is_file():
+            raise ValueError(f"no run {resume} under {out}; give the name of a run folder there")
+        if not resume.startswith(stem := runs.stem(system, q) + "-"):
+            said = runs.Run(out / resume).settings()
+            now = {"system": system.name, "options": system.options(), **q}
+            differ = [k for k in now if said.get(k) != now[k]]
+            raise ValueError(f"{resume} answers another question than this launch; it differs in "
+                             f"{', '.join(differ) or 'the question'}. Resume it with the same system, options, "
+                             f"dataset and rows, or leave out resume for a new run (its name starts {stem})")
+        return resume
 
     def check(self) -> dict[str, int]:
         """Checks the dataset with no call: every row, input file and gold. Returns how many rows it has."""
@@ -144,20 +173,20 @@ class Benchmark:
         chose = "; ".join(f"{k} {said(v)}" for k, v in p.question["rows"].items())
         out = [f"{self.task.name} on {self.dataset} ({self.manifest}): {errors.counted(len(p.rows), 'row')}"
                f"{f' ({chose})' if chose else ''}, graded by {', '.join(s.name for s in self.scorers)}"]
-        out.append(f"  {p.run.folder}: {sum(p.run.needs(x.id, p.retry_failed) for x in p.rows)} to predict, "
-                   f"{p.workers} at a time")
+        out.append(f"  {p.run.folder} ({'resumed' if p.run.settings() else 'a new run'}): "
+                   f"{sum(p.run.needs(x.id, p.retry_failed) for x in p.rows)} to predict, {p.workers} at a time")
         return "\n".join(out)
 
     def predict(self, p: Plan, executor: Callable[[int], cf.Executor] = cf.ThreadPoolExecutor) -> None:
         """Sends every row the run lacks to its system, `p.workers` at a time, and saves each answer as it arrives.
         An exception (an account, a refused connection, a bug) or an interrupt stops the run once the calls in
-        flight are saved; the same command resumes.
+        flight are saved; `plan(..., resume=<its name>)` continues it.
 
         `executor` makes the pool from a number of workers: threads by default. Another executor (processes, a
         cluster) runs `predict_row` elsewhere, while this machine chooses the rows and saves every record. A
         factory returning one shared pool lets several runs share a rate limit."""
         r = p.run
-        r.prepare(p.question, data.commit(self.dataset, data.download_dataset(self.dataset)), p.timeout)
+        r.prepare(p.question, data.commit(self.dataset, data.download_dataset(self.dataset)), p.timeout, p.launch)
         self._read_unread(r, p.rows)
         work = collections.deque(x for x in p.rows if r.needs(x.id, p.retry_failed))
         live: dict[cf.Future, data.Row] = {}
@@ -177,7 +206,7 @@ class Benchmark:
                     for f in finished: failure = _saved(r, live.pop(f), f, board) or failure
             except KeyboardInterrupt:
                 # Note: the calls in flight are paid for, so they are saved before the interrupt goes on.
-                log.warning("interrupted: saving the calls in flight; run the same command again to resume")
+                log.warning("interrupted: saving the calls in flight; resume %s to continue", r.name)
                 for f in cf.as_completed(live): _saved(r, live[f], f, board)
                 raise
         if failure is not None: raise failure
@@ -205,7 +234,8 @@ class Benchmark:
 
     def run(self, system: adapter.Adapter, out: str | Path, *,
             executor: Callable[[int], cf.Executor] = cf.ThreadPoolExecutor, **kwargs: Any) -> dict[str, Any]:
-        """`plan`, then `predict` (with `executor`), then `grade`; `kwargs` are `plan`'s. Returns the grading."""
+        """`plan`, then `predict` (with `executor`), then `grade`; `kwargs` are `plan`'s, so each call is a new run
+        unless it gives `resume`. Returns the grading."""
         p = self.plan(system, out, **kwargs)
         log.info("%s", self.describe(p))
         self.predict(p, executor)
@@ -273,8 +303,8 @@ def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: f
     try:
         x = t.input(row)
     except FileNotFoundError as exc:
-        exc.add_note(f"the input of row {row.id} disappeared after the run was planned; restore it and run the same "
-                     "command again")
+        exc.add_note(f"the input of row {row.id} disappeared after the run was planned; restore it and resume the "
+                     "run")
         raise
     return adapter.predict(system, x, timeout=timeout)
 
@@ -289,7 +319,7 @@ def _saved(r: runs.Run, x: data.Row, f: cf.Future, board: progress.Board) -> Bas
             return errors.noted(exc, type(r.system), f"predicting {x.id}")
         r.save(x.id, unread)
         return errors.noted(exc, type(r.system), f"reading the answer of {x.id}; the answer is saved, and is read "
-                            "again when you run the same command after the fix")
+                            f"again when you resume {r.name} after the fix")
     except BaseException as exc:
         return exc
     r.save(x.id, rec)
