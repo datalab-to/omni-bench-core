@@ -205,6 +205,10 @@ places, such as a Hugging Face address on one machine and a local copy on anothe
 `dataset_name`: the question then names the dataset by it, so a run is the same question, and can be resumed,
 wherever the data is read from.
 
+settings.json records the dataset's commit: the Hub's commit for an `hf://` dataset, or, for a folder, the one its
+`COMMIT` file names (one line, written by whatever copied the folder there; a folder without one has no commit).
+Resuming a run refuses a dataset whose commit changed since, so no run answers two versions of the data.
+
 ### Scorer
 
 A scorer is one way of grading: a frozen dataclass whose fields are its options. You write:

@@ -108,7 +108,7 @@ class Run:
     def prepare(self, question: Mapping[str, Any], dataset_commit: str | None, timeout: float,
                 launch: Mapping[str, Any] | None = None) -> None:
         """Makes the run's folders, and writes settings.json before the first call: the question, the dataset's
-        commit (`dataset_commit`, for an `hf://` dataset), the timeout, and the launch (`started`, UTC, and `launch`,
+        commit (`dataset_commit`, for an `hf://` dataset or a folder with a `COMMIT` file), the timeout, and the launch (`started`, UTC, and `launch`,
         the caller's own record of it). A resumed run keeps its first launch's settings.json but the timeout, which
         may change, and refuses a dataset whose commit changed since: its rows would be answered against two
         versions of the data."""

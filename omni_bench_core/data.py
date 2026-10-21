@@ -3,6 +3,7 @@
 A dataset is a folder, or `hf://datasets/<org>/<name>[@<revision>]`, downloaded whole on first use. It holds:
 
     manifest.parquet       one row per thing to predict: its id, its input files and its gold file
+    COMMIT                 optional, in a folder: the version of the data it holds, one line
     <any folder>/<file>    the input files; several rows may share one
     <any folder>/<id>.json each row's gold, named after its row
 
@@ -28,6 +29,7 @@ log = logging.getLogger(__name__)
 
 HF_PREFIX = "hf://datasets/"
 MANIFEST = "manifest.parquet"
+COMMIT = "COMMIT"
 DOWNLOAD_ATTEMPTS = 5
 
 
@@ -130,8 +132,16 @@ def dataset_id(dataset: str | Path) -> str:
 
 
 def commit(dataset: str | Path, root: Path) -> str | None:
-    """The commit an `hf://` dataset was read at (its downloaded folder's name); None for a folder."""
-    return root.name if hf_dataset(dataset) is not None else None
+    """The commit an `hf://` dataset was read at (its downloaded folder's name), or the one a folder's `COMMIT` file
+    names, which whatever copied the folder there writes; None for a folder without one."""
+    if hf_dataset(dataset) is not None:
+        return root.name
+    if not (f := root / COMMIT).is_file():
+        return None
+    if not (said := f.read_text().strip()) or len(said.split()) != 1:
+        raise ValueError(f"{f} must hold one commit on one line, not {said!r}; write the commit the folder holds, "
+                         "or delete the file")
+    return said
 
 
 def manifest_path(manifest: str) -> str:

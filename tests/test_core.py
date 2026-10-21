@@ -972,6 +972,20 @@ def test_a_dataset_name_makes_one_question_wherever_the_data_is_read(tmp: Path) 
     refused(benchmark.Benchmark, Copying(), here, [Exact()], dataset_name=" ", match="dataset_name is ' '")
 
 
+
+def test_a_folder_names_its_commit_and_a_resume_refuses_another(tmp: Path) -> None:
+    d = dataset(tmp / "data")
+    first = bench(d).run(GoldEcho(), tmp / "runs")["run"]
+    assert "dataset_commit" not in json.loads((tmp / "runs" / first / "settings.json").read_text())   # no COMMIT
+    (d / data.COMMIT).write_text("abc123\n")
+    b = bench(d)
+    one = b.run(GoldEcho(), tmp / "runs")["run"]
+    assert json.loads((tmp / "runs" / one / "settings.json").read_text())["dataset_commit"] == "abc123"
+    (d / data.COMMIT).write_text("def456")
+    refused(b.run, GoldEcho(), tmp / "runs", resume=one, match="at commit abc123, and it is now at def456")
+    (d / data.COMMIT).write_text("two words")
+    refused(data.commit, d, d, match="one commit on one line")
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):
