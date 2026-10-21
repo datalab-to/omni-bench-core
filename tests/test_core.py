@@ -929,6 +929,20 @@ def test_everything_written_is_plain_json(tmp: Path) -> None:
     refused(bench(tmp / "d", ObjectSummary()).grade, tmp / "runs" / name, match="summarize's summary isn't plain JSON")
 
 
+def test_progress_lines_say_failed_and_cost(tmp: Path) -> None:
+    said: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda r: said.append(r.getMessage())
+    logging.getLogger("omni_bench_core").addHandler(handler)
+    logging.getLogger("omni_bench_core").setLevel(logging.INFO)
+    try:
+        bench(dataset(tmp / "d")).run(Copy(), tmp / "runs", workers=1)     # not a terminal: one line per answer
+    finally:
+        logging.getLogger("omni_bench_core").removeHandler(handler)
+    last = [m for m in said if " 5/5 " in m]
+    assert last and last[0].endswith("; 1 failed, $1.00"), said     # c1 is refused; four answers at $0.25
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):

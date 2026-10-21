@@ -56,8 +56,10 @@ class Board:
         if rec["error"] is not None:
             e = rec["error"]
             log.info("%s: %s failed: %s: %s", self.run, id, e["type"], str(e["message"])[:160])
-        elif not self.live:
-            log.info("%s: %d/%d %s", self.run, self.done, self.todo, id)
+        # Note: a log line per answer says what the table would: done, failed and cost so far.
+        if not self.live:
+            cost = "no cost reported" if self.usd is None else f"${self.usd:.2f}"
+            log.info("%s: %d/%d %s; %d failed, %s", self.run, self.done, self.todo, id, self.failed, cost)
 
     def _table(self) -> Any:
         from rich.table import Table
