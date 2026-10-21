@@ -105,16 +105,17 @@ class Run:
                 raise ValueError(f"{self.folder} answers {key} {_spelled(was)}, not {_spelled(question[key])}: "
                                  f"grade it with the {key} it was run on")
 
-    def prepare(self, question: Mapping[str, Any], commit: str | None, timeout: float,
+    def prepare(self, question: Mapping[str, Any], dataset_commit: str | None, timeout: float,
                 launch: Mapping[str, Any] | None = None) -> None:
         """Makes the run's folders, and writes settings.json before the first call: the question, the dataset's
-        commit, the timeout, and the launch (`started`, UTC, and `launch`, the caller's own record of it). A
-        resumed run keeps its first launch's settings.json but the timeout, which may change, and refuses a dataset
-        whose commit changed since: its rows would be answered against two versions of the data."""
+        commit (`dataset_commit`, for an `hf://` dataset), the timeout, and the launch (`started`, UTC, and `launch`,
+        the caller's own record of it). A resumed run keeps its first launch's settings.json but the timeout, which
+        may change, and refuses a dataset whose commit changed since: its rows would be answered against two
+        versions of the data."""
         assert self.system is not None, "only a run with a system predicts"
         if (said := self.settings()):
-            if (was := said.get("commit")) and commit and was != commit:
-                raise ValueError(f"{self.folder} was run on the dataset at commit {was}, and it is now at {commit}; "
+            if (was := said.get("dataset_commit")) and dataset_commit and was != dataset_commit:
+                raise ValueError(f"{self.folder} was run on the dataset at commit {was}, and it is now at {dataset_commit}; "
                                  "start a new run (leave out resume)")
             if said.get("timeout_s") != timeout:
                 write_json(self.folder / "settings.json", {**said, "timeout_s": timeout})
@@ -124,7 +125,7 @@ class Run:
         started = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
         write_json(self.folder / "settings.json", {"run": self.name, "system": self.system.name,
                                                    "options": self.system.options(), **question,
-                                                   **({"commit": commit} if commit else {}), "timeout_s": timeout,
+                                                   **({"dataset_commit": dataset_commit} if dataset_commit else {}), "timeout_s": timeout,
                                                    "started": started, "launch": dict(launch or {})})
 
     def record(self, id: str) -> dict[str, Any] | None:

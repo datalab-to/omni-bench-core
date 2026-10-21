@@ -175,8 +175,8 @@ the answers: the system and its options, the dataset, the manifest, the task, an
 
 ```
   runs/copy-1a2b3c4d/                 <system name>-<digest of the question>
-    settings.json                     the question: system, options, dataset, manifest, task and rows; and
-                                      the timeout
+    settings.json                     the question: system, options, dataset, manifest, task and rows; the
+                                      dataset's commit; and the timeout
     records/a1.json                   everything about one row's call: output, raw answer, error, cost
     predictions/a1.json               just the output; this is what grading reads
     exact/                            one folder per scorer
