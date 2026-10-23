@@ -129,7 +129,6 @@ class Benchmark:
         launch = dict(launch or {})
         errors.plain(launch, "launch")
         adapter.check_keys(system)
-        adapter.check_served(system)
         every = self.rows()
         selection = data.selection(limit, sample, only)
         chosen = data.select(every, **selection)
@@ -138,6 +137,8 @@ class Benchmark:
         q = self.question(selection)
         self._inputs(chosen)
         for s in self.scorers: s.check_gold(every)
+        # Note: after the checks that cost nothing, so a wrong dataset is refused without a server.
+        adapter.check_served(system)
         folder = Path(out) / (self._resumed(system, q, Path(out), resume) if resume is not None
                               else runs.folder_name(system, q, runs.new_id()))
         return Plan(runs.Run(folder, system), q, chosen, timeout, workers or type(system).workers, retry_failed,
