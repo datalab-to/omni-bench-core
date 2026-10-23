@@ -973,7 +973,33 @@ def test_a_dataset_name_makes_one_question_wherever_the_data_is_read(tmp: Path) 
 
 
 
+@dataclasses.dataclass(frozen=True)
+class Inner:
+    a: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Stops(Copy):
+    name: ClassVar[str] = "stops"
+    stops: tuple[str, ...] = ("x",)
+
+
+@dataclasses.dataclass(frozen=True)
+class Nested(Copy):
+    name: ClassVar[str] = "nested"
+    inner: Inner = dataclasses.field(default_factory=Inner)
+
+
+def test_options_from_a_config_are_the_types_the_adapter_takes(tmp: Path) -> None:
+    """A config's list is a tuple option's tuple, so the adapter is the one its class describes; a nested dataclass
+    option, which a config can't say, is refused."""
+    assert adapter.configure(Stops, {"stops": ["a", "b"]}) == Stops(stops=("a", "b"))
+    refused(adapter.configure, Nested, {"inner": {"a": 2}}, match="option inner is a Inner, a dataclass")
+
+
 def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -> None:
+    import os
+
     import yaml
 
     from omni_bench_core import config
@@ -991,9 +1017,12 @@ def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -
     assert len(p.rows) == 3 and p.timeout == 60.0 and p.workers == 1
     b.predict(p)
     # the run keeps its config resolved, and loading it again asks the same question
-    kept = config.load(config.write(c, s, p.run.folder))
-    assert kept.rows.limit == 3 and kept.system == {"copy": s.options()}
+    kept = config.load(config.write(c, b, s, p.run.folder))
+    assert kept.rows.limit == 3 and kept.system == {"copy": s.options()} and kept.scorers == {"exact": Exact().options()}
     assert config.plan(kept, b, s, tmp / "runs", resume=p.run.name).run.folder == p.run.folder
+    # a dataset folder is kept as its full path, so the config reads the same folder from anywhere
+    rel = config.parse({**good, "dataset": os.path.relpath(good["dataset"])}, "rel")
+    assert config.resolved(rel, b, s)["dataset"] == str(Path(good["dataset"]).resolve())
     # a template writes every option of the system, at its defaults
     t = config.template(make, "copy", dataset="d", manifest="manifest.parquet", scorers={"exact": {}}, timeout=60)
     assert config.parse(t, "t").system == {"copy": Copy().options()}
@@ -1009,6 +1038,11 @@ def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -
         refused(config.load, path, sets, match=match)
     refused(config.scorers, config.parse({**good, "scorers": {"nope": {}}}, "x"), {"exact": Exact}, match="no scorer 'nope'")
     refused(config.system, config.parse({**good, "system": {"nope": {}}}, "x"), make, match="no system 'nope'")
+    refused(config.apply, {"system": {"m": {True: 1}}}, ["system.m.on=2"], match="system.m has True")
+    refused(config.apply, {"system": {"m.x": {"v": 1}, "m": {"x": {"v": 2}}}}, ["system.m.x.v=5"], match="could be read as")
+    refused(config.apply, {"scorers": {"e": [{"x": 1}]}}, ["scorers.e.0.x=2"], match="scorers.e is a list")
+    refused(config.parse, {**good, "scorers": {"exact": 5}}, "x", match="scorers.exact is 5; give its options")
+    refused(config.parse, {**good, "rows": {**good["rows"], "only": [83]}}, "x", match="quote it")
     dotted = {"system": {"org/model-1.5": {"x": {"y": 1}}}}
     assert config.apply(dotted, ["system.org/model-1.5.x.y=2"]) == {"system": {"org/model-1.5": {"x": {"y": 2}}}}
 

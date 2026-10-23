@@ -229,6 +229,12 @@ def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
     for k, v in options.items():
         errors.plain(v, f"{cls.name}'s option {k} ({v!r})")
         t = hints.get(k)
+        # Note: a config is JSON or YAML, which have lists and no tuples, and a nested option has no class to rebuild.
+        if typing.get_origin(t) is tuple and isinstance(v, list):
+            options[k] = tuple(v)
+        if dataclasses.is_dataclass(t):
+            raise TypeError(f"{cls.name}: option {k} is a {t.__name__}, a dataclass; an option is a plain value "
+                            "(str, int, float, bool, a list or a dict), so a config can say it")
         if t not in (str, int, float, bool): continue
         if t is float and isinstance(v, int) and not isinstance(v, bool):
             options[k] = float(v)

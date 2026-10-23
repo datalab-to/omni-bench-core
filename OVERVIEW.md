@@ -377,7 +377,7 @@ c = config.load("copy.yaml", ["rows.sample=5"])          # --set path=value chan
 b = config.benchmark(c, Copying(), {"exact": Exact})     # the package names its scorers
 s = config.system(c, make)                               # and builds its systems: make(name, options)
 p = config.plan(c, b, s, "runs")
-config.write(c, s, p.run.folder)                          # the run keeps its config.yaml, every option resolved
+config.write(c, b, s, p.run.folder)                       # the run keeps its config.yaml, every option resolved
 ```
 
 A config is checked for its shape when it loads: every key given, of its kind, and nothing else. Its scorers and

@@ -5,7 +5,7 @@
 - `scorers`, `system` and `benchmark`: what a config asks, built from a package's own scorers and systems, each
   checked by its own class;
 - `plan`: the run a config asks of a benchmark (`Benchmark.plan`); and
-- `resolved` and `write`: the config as a run keeps it, the system's options as it takes them.
+- `resolved` and `write`: the config as a run keeps it, the scorers' and system's options as they take them.
 
     dataset: hf://datasets/datalab-to/omni_parse_bench   a folder or an hf:// address
     manifest: manifest.parquet     which of its rows, with which files
@@ -23,7 +23,8 @@
 
 A config never refers to another file and nothing in it has a default, so the file says the whole run. `--set`
 changes a value the file has, at its path (`system.datalab.mode=accurate`); a path the file hasn't is refused, so a
-mistyped one never adds a key. The value is read as YAML: `150`, `true`, `[a, b]`, `{exact_text: {}}`. A package adds
+mistyped one never adds a key. The value is read as YAML: `150`, `true`, `[a, b]`, `{exact_text: {}}`; quote one YAML
+would read as another kind (`'00123'`, `'no'`, `'1.10'`). A package adds
 what is its own by subclassing `Config` (another key, a check across keys); its scorers and systems are named by it.
 """
 
@@ -68,6 +69,14 @@ class Config(pydantic.BaseModel):
     workers: pydantic.NonNegativeInt
     system: dict[str, dict[str, Any]]
 
+    @pydantic.field_validator("scorers", mode="before")
+    @classmethod
+    def _options(cls, given: Any) -> Any:
+        for k, v in given.items() if isinstance(given, dict) else ():
+            if not (isinstance(v, dict) or (isinstance(v, list) and all(isinstance(x, dict) for x in v))):
+                raise ValueError(f"scorers.{k} is {v!r}; give its options, such as {{}}, or a list of them")
+        return given
+
     @pydantic.field_validator("system")
     @classmethod
     def _one(cls, given: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -106,6 +115,8 @@ def parse[C: Config](c: dict[str, Any], where: str, model: type[C] = Config, **c
             msg = SAID.get(e["type"], e["msg"]).removeprefix("Value error, ")
             if e["type"] not in (*SAID, "value_error"):
                 msg += f"; it is {e['input']!r}"
+            if e["type"] == "string_type":
+                msg += " (YAML read it as another kind: quote it)"
             said.append(f"{at}: {msg}" if at else msg)
         raise ValueError(f"{where}: " + "; ".join(said)) from None
 
@@ -122,11 +133,19 @@ def apply(c: dict[str, Any], sets: list[str]) -> dict[str, Any]:
             raise ValueError(f"--set {s!r}: write path=value, such as rows.sample=5")
         node, here, rest = out, [], path.split(".")
         while rest:
-            # Note: the longest key that matches, so a key with a dot in it (a model id) is reachable.
-            n = next((n for n in range(len(rest), 0, -1) if isinstance(node, dict) and ".".join(rest[:n]) in node), 0)
+            if isinstance(node, list):
+                raise ValueError(f"--set {path}: {'.'.join(here)} is a list; set it whole, such as "  # noqa: TRY004
+                                 f"{'.'.join(here)}=[...]")
+            # Note: a key may have a dot in it (a model id), so each way of splitting the path is tried.
+            ns = [n for n in range(len(rest), 0, -1) if isinstance(node, dict) and ".".join(rest[:n]) in node]
+            if len(ns) > 1:
+                raise ValueError(f"--set {path}: {'.'.join(rest)} could be read as "
+                                 + " or ".join(".".join(rest[:n]) for n in ns) + " under "
+                                 + ('.'.join(here) or 'the config') + "; change the file instead")
+            n = ns[0] if ns else 0
             if not n:
                 k = rest[0]
-                have = sorted(node) if isinstance(node, dict) else []
+                have = sorted(map(str, node)) if isinstance(node, dict) else []
                 near = difflib.get_close_matches(k, have, n=1)
                 raise ValueError(
                     f"--set {path}: the config has no {'.'.join([*here, k])}"
@@ -170,19 +189,26 @@ def plan(c: Config, b: core.Benchmark, s: adapter.Adapter, out: str | Path, **kw
                   workers=c.workers, **kw)
 
 
-def resolved(c: Config, s: adapter.Adapter) -> dict[str, Any]:
-    """The config as plain JSON, its system's options as the system takes them (its defaults filled in)."""
-    return {**c.model_dump(mode="json"), "system": {next(iter(c.system)): s.options()}}
+def resolved(c: Config, b: core.Benchmark, s: adapter.Adapter) -> dict[str, Any]:
+    """The config as plain JSON, its scorers' and its system's options as `b`'s scorers and `s` take them (their
+    defaults filled in), and a dataset folder as its full path, so the config reads the same folder from anywhere."""
+    by: dict[str, list[dict[str, Any]]] = {}
+    for x in b.scorers: by.setdefault(x.name, []).append(x.options())
+    out = {**c.model_dump(mode="json"), "scorers": {k: v[0] if len(v) == 1 else v for k, v in by.items()},
+           "system": {next(iter(c.system)): s.options()}}
+    if out["dataset"] and Path(out["dataset"]).is_dir():
+        out["dataset"] = str(Path(out["dataset"]).resolve())
+    return out
 
 
-def write(c: Config, s: adapter.Adapter, folder: str | Path) -> Path:
+def write(c: Config, b: core.Benchmark, s: adapter.Adapter, folder: str | Path) -> Path:
     """The config resolved (`resolved`), as YAML, in `folder`'s `FILE`, so the run says the whole of what it ran
     and `load` reruns it."""
     import yaml
 
     path = Path(folder) / FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(resolved(c, s), sort_keys=False, width=1000, allow_unicode=True))
+    path.write_text(yaml.safe_dump(resolved(c, b, s), sort_keys=False, width=1000, allow_unicode=True))
     return path
 
 
