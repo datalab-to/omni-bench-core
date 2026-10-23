@@ -997,6 +997,55 @@ def test_options_from_a_config_are_the_types_the_adapter_takes(tmp: Path) -> Non
     refused(adapter.configure, Nested, {"inner": {"a": 2}}, match="option inner is a Inner, a dataclass")
 
 
+SERVER: dict[str, Any] = {}   # what ServedCopy's server says it serves
+
+
+@dataclasses.dataclass(frozen=True)
+class ServedCopy(adapter.Served):
+    """Copies the file's text, as a model served by us would answer; its server says it serves `SERVER`."""
+
+    name: ClassVar[str] = "served_copy"
+
+    def call(self, x: Path, *, timeout: float) -> adapter.Call:
+        return adapter.Call(raw={"answer": x.read_text()})
+
+    def read(self, raw: Any, x: Path) -> Any:
+        with adapter.reading("the answer"):
+            return {"text": raw["answer"]}
+
+    def server(self, *, timeout: float) -> dict[str, Any]:
+        if not SERVER: raise ConnectionRefusedError("nothing listens")
+        return dict(SERVER)
+
+
+def test_how_a_model_is_served_is_part_of_the_question_and_checked_before_any_call(tmp: Path) -> None:
+    """Two servings of one model are two runs; a server that serves something other than `served` says is refused
+    before any call, as is one that isn't running; `served` is required."""
+    b = bench(dataset(tmp / "d"))
+    one = {"weights": "org/m", "revision": "a" * 40, "vllm": "0.20.1", "args": ["--max-model-len 8192"]}
+    SERVER.update(weights="org/m", revision="a" * 40, vllm="0.20.1")
+    p = b.plan(ServedCopy(served=one), tmp / "runs")
+    other = b.plan(ServedCopy(served={**one, "args": ["--max-model-len 4096"]}), tmp / "runs")
+    assert p.run.folder.name.split("-")[1] != other.run.folder.name.split("-")[1]
+    b.predict(p)
+    assert b.grade(p.run)["scorers"]["exact"]["headline"] == 1.0
+    assert json.loads((p.run.folder / "settings.json").read_text())["options"]["served"] == one
+    SERVER.update(revision="b" * 40)
+    refused(b.plan, ServedCopy(served={**one, "revision": "b" * 40}), tmp / "runs", resume=p.run.name,
+            match="answers another question")
+    said = refused(b.plan, ServedCopy(served=one), tmp / "runs", match="serves something other than its served says")
+    assert f"revision is {'b' * 40!r} there and {'a' * 40!r} in served" in said, said
+    SERVER.update(revision="a" * 40, quantization="fp8")
+    refused(b.plan, ServedCopy(served=one), tmp / "runs", match="quantization is 'fp8' there and '(not given)'")
+    SERVER.clear()
+    try:
+        b.plan(ServedCopy(served=one), tmp / "runs")
+        raise AssertionError("a server that isn't running was not refused")
+    except ConnectionRefusedError as exc:
+        assert "couldn't ask its server what it serves" in exc.__notes__[0], exc.__notes__
+    refused(adapter.configure, ServedCopy, {}, match="needs its served")
+
+
 def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -> None:
     import os
 

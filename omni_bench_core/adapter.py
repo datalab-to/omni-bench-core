@@ -1,10 +1,11 @@
 """Adapters: how systems are reached, and the rules every call follows.
 
-- `Adapter`: the class to subclass for a system;
+- `Adapter`: the class to subclass for a system, and `Served`, for one whose answers come from a server we run;
 - `Call` and `Cost`: what `Adapter.call` returns;
 - `Budget`, `PollRetry` and `reading`: helpers for writing `call` and `read`;
 - `predict`, `record` and `reread`: one row's call under the rules, and its record;
-- `configure`: an adapter or a scorer from a config's options, checked; and
+- `configure`: an adapter or a scorer from a config's options, checked;
+- `check_served`: a served system's server, checked against what its `served` says; and
 - `retryable`: whether a recorded failure may succeed in a later run.
 """
 
@@ -24,6 +25,7 @@ from typing import Any, ClassVar, NamedTuple, final
 from omni_bench_core import errors
 
 DEFAULT_TIMEOUT = 1800.0
+SERVER_TIMEOUT = 60.0  # seconds a server has to say what it serves
 # Phrases systems use for an account that can't pay, when the HTTP status doesn't say so.
 ACCOUNT_MARKERS = ("exceeded the maximum number of credits", "subscription has expired", "insufficient_quota",
                    "insufficient credits")
@@ -86,7 +88,8 @@ class Adapter[I](abc.ABC):
 
     Its fields are its options: they are written to the run's settings.json and digested into its folder's
     name, so one folder holds one configuration. `call` gets the task's input, never the row (which holds the
-    gold), and is called from `workers` threads at once, so anything it shares must be thread-safe.
+    gold), and is called from `workers` threads at once, so anything it shares must be thread-safe. A system whose
+    answers come from a server we run subclasses `Served` instead, which adds what the server is to its options.
 
     Optional, with defaults:
 
@@ -149,6 +152,49 @@ class Adapter[I](abc.ABC):
         out = dataclasses.asdict(self)
         errors.plain(out, f"{type(self).__name__}'s options")
         return out
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Served[I](Adapter[I]):
+    """A system whose answers come from a server we run (a model served by vLLM, or a pipeline's server), not a
+    vendor's. How the model is served decides its answers as much as how it is asked, so it is an option:
+
+        served   what the server is: its weights, their revision, its software and its flags, such as
+                 {weights: org/model, revision: <commit>, vllm: 0.20.1, args: [--max-model-len 131072]}; its keys
+                 are the server's own
+
+    and part of the run's question, so two servings of a model are two runs, and a run is never resumed against
+    another one. `server` asks the server what it serves; before any call, a run refuses a server that says
+    something other than `served` about any key it reports (`check_served`). What a server can't report (its
+    flags, often) is true when its serve folder started it from `served`, and is the config's word otherwise."""
+
+    served: dict[str, Any]
+
+    @abc.abstractmethod
+    def server(self, *, timeout: float) -> dict[str, Any]:
+        """What the server this adapter calls says it serves, such as {weights, revision, vllm}: the keys it can
+        report, each as `served` states it."""
+
+
+def check_served(a: Adapter, *, timeout: float = SERVER_TIMEOUT) -> None:
+    """Refuses a served system whose server says something other than its `served` about any key the server
+    reports, before any call. A system that isn't `Served` passes."""
+    if not isinstance(a, Served): return
+    try:
+        got = a.server(timeout=timeout)
+    except Exception as exc:
+        if errors.refused(exc) and not getattr(exc, "__notes__", None):
+            exc.add_note(f"{a.label} couldn't ask its server what it serves: the connection was refused. Start the "
+                         "server (or give its base_url), then run again")
+        raise
+    if not isinstance(got, dict):
+        raise TypeError(f"{type(a).__name__}.server must return a dict, not a {type(got).__name__}")
+    errors.plain(got, f"what {a.label}'s server says it serves")
+    if wrong := [k for k, v in got.items() if k not in a.served or a.served[k] != v]:
+        raise ValueError(f"{a.label}'s server serves something other than its served says: "
+                         + "; ".join(f"{k} is {got[k]!r} there and {a.served.get(k, '(not given)')!r} in served"
+                                     for k in wrong)
+                         + ". Serve what served says, or say in served what the server serves")
 
 
 class Budget:
@@ -225,6 +271,9 @@ def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
         raise ValueError(f"{cls.name} has no option {unknown[0]!r}"
                          + (f" (did you mean {near[0]!r}?)" if near else "")
                          + f"; its options are: {', '.join(fields) or '(none)'}")
+    if needed := [f.name for f in dataclasses.fields(cls) if f.name not in options and f.init
+                  and f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING]:
+        raise ValueError(f"{cls.name} needs its {', '.join(needed)}, an option with no default; give it")
     hints = typing.get_type_hints(cls)
     for k, v in options.items():
         errors.plain(v, f"{cls.name}'s option {k} ({v!r})")

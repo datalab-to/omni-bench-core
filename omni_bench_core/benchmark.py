@@ -129,6 +129,7 @@ class Benchmark:
         launch = dict(launch or {})
         errors.plain(launch, "launch")
         adapter.check_keys(system)
+        adapter.check_served(system)
         every = self.rows()
         selection = data.selection(limit, sample, only)
         chosen = data.select(every, **selection)

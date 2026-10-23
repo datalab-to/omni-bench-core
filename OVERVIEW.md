@@ -167,6 +167,24 @@ A row counts 0 only when you say the system failed:
   exception whose message says what to fix. Declare `keys`, and a missing key is refused before any call. If
   `read` raised it, the answer is kept, and resuming the run after the fix reads it with no call.
 
+A system whose answers come from a server you run (a model served by vLLM, a pipeline's server) subclasses
+`adapter.Served`. How a model is served decides its answers as much as how it is asked, so it is an option,
+`served`, and part of the run's question: its weights, their revision, its software and its flags. `server`
+asks the server what it serves, and before any call a run refuses a server that says otherwise about any key
+it reports:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class MyModel(adapter.Served):
+    base_url: str = "http://127.0.0.1:8000"
+
+    def call(self, x, *, timeout): ...
+    def server(self, *, timeout):           # what the server says it serves, such as {weights, revision, vllm}
+        return httpx.get(f"{self.base_url}/served", timeout=timeout).json()
+
+MyModel(served={"weights": "org/model", "revision": "<commit>", "vllm": "0.20.1", "args": ["--max-model-len 8192"]})
+```
+
 ### Run
 
 A run is one system's answers to one exact question, kept in a folder. The question is everything that changes
