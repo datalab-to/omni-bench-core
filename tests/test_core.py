@@ -229,8 +229,7 @@ def test_each_launch_is_a_new_run_and_resume_continues_only_the_same_question(tm
     b = bench(dataset(tmp / "d"))
     one = b.run(GoldEcho(), tmp / "runs", launch={"by": "me", "commit": "abc"})["run"]
     two = b.run(GoldEcho(), tmp / "runs")["run"]
-    stem = runs.stem(GoldEcho(), b.question())
-    assert one != two and one.startswith(stem + "-") and two.startswith(stem + "-"), (one, two)
+    assert one != two and one.startswith("gold_echo-") and two.startswith("gold_echo-"), (one, two)
     said = json.loads((tmp / "runs" / one / "settings.json").read_text())
     assert said["launch"] == {"by": "me", "commit": "abc"} and said["started"].endswith("+00:00"), said
     CALLS.clear()
@@ -339,9 +338,9 @@ def test_refused_before_any_call(tmp: Path) -> None:
     refused(adapter.configure, Exact, {"strict": True}, match="exact has no option 'strict'")
     refused(adapter.configure, Doc, {}, match="an adapter or a scorer")
     q = b.question()
-    name = functools.partial(runs.stem, question=q)
-    assert name(Copy()) == name(Copy(temperature=0.0)) != name(Copy(upper=True))
-    assert runs.stem(Copy(), q) != runs.stem(Copy(), b.question({"sample": 2}))
+    asks = functools.partial(runs.identity, question=q)
+    assert asks(Copy()) == asks(Copy(temperature=0.0)) != asks(Copy(upper=True))
+    assert runs.identity(Copy(), q) != runs.identity(Copy(), b.question({"sample": 2}))
     refused(b.plan, [Copy()], tmp / "runs", match="not one adapter instance")
     refused(b.plan, GoldEcho(), tmp / "runs", workers=-1, match="workers is -1")
     refused(benchmark.Benchmark, Copying(), tmp / "ok", (), match="at least one scorer")
@@ -597,7 +596,7 @@ class CopyingTwice(Copying):
 def test_another_task_is_another_folder(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"))
     other = benchmark.Benchmark(CopyingTwice(), tmp / "d", [Exact()])
-    assert runs.stem(GoldEcho(), b.question()) != runs.stem(GoldEcho(), other.question())
+    assert runs.identity(GoldEcho(), b.question()) != runs.identity(GoldEcho(), other.question())
     name = b.run(GoldEcho(), tmp / "runs")["run"]
     refused(other.grade, tmp / "runs" / name, match="answers task")
     assert json.loads((tmp / "runs" / name / "settings.json").read_text())["task"] == {"name": "copying", "options": {}}
@@ -966,7 +965,7 @@ def test_progress_lines_say_failed_and_cost(tmp: Path) -> None:
 def test_a_dataset_name_makes_one_question_wherever_the_data_is_read(tmp: Path) -> None:
     here, there = dataset(tmp / "here"), dataset(tmp / "there")      # one dataset, read from two places
     named = [benchmark.Benchmark(Copying(), d, [Exact()], dataset_name="texts") for d in (here, there)]
-    assert len({runs.stem(Copy(), b.question()) for b in named}) == 1
+    assert named[0].question() == named[1].question()
     assert named[0].question()["dataset"] == "texts"
     assert bench(here).question()["dataset"] != bench(there).question()["dataset"]     # without it, the address
     refused(benchmark.Benchmark, Copying(), here, [Exact()], dataset_name=" ", match="dataset_name is ' '")
@@ -1026,8 +1025,11 @@ def test_how_a_model_is_served_is_part_of_the_question_and_checked_before_any_ca
     one = {"weights": "org/m", "revision": "a" * 40, "vllm": "0.20.1", "args": ["--max-model-len 8192"]}
     SERVER.update(weights="org/m", revision="a" * 40, vllm="0.20.1")
     p = b.plan(ServedCopy(base_url="http://a", served=one), tmp / "runs")
-    other = b.plan(ServedCopy(base_url="http://a", served={**one, "args": ["--max-model-len 4096"]}), tmp / "runs")
-    assert p.run.folder.name.split("-")[1] != other.run.folder.name.split("-")[1]
+    q = b.question()
+    assert runs.identity(ServedCopy(base_url="http://a", served=one), q) != runs.identity(
+        ServedCopy(base_url="http://a", served={**one, "args": ["--max-model-len 4096"]}), q)
+    assert runs.identity(ServedCopy(base_url="http://a", served=one), q) == runs.identity(
+        ServedCopy(base_url="http://b", served=one), q)
     b.predict(p)
     assert b.grade(p.run)["scorers"]["exact"]["headline"] == 1.0
     said = json.loads((p.run.folder / "settings.json").read_text())

@@ -192,10 +192,10 @@ MyModel(served={"weights": "org/model", "revision": "<commit>", "vllm": "0.20.1"
 
 A run is one system's answers to one exact question, kept in a folder. The question is everything that changes
 the answers: the system and its options, the dataset, the manifest, the task, and which rows (`sample`, `limit`,
-`only`). The folder's name is a digest of it:
+`only`). settings.json keeps it, and a resume must match it:
 
 ```
-  runs/copy-1a2b3c4d/                 <system name>-<digest of the question>
+  runs/copy-20261021-160012-3f9a/     <system label>-<time>-<4 hex>
     settings.json                     the question: system, options, dataset, manifest, task and rows; the
                                       dataset's commit; and the timeout
     records/a1.json                   everything about one row's call: output, raw answer, error, cost
@@ -210,9 +210,9 @@ Everything in a run folder is plain JSON: dicts, lists, strings, finite numbers,
 option, a raw answer, `read`'s output, a scorer's result and a summary must be plain JSON too, and the core
 refuses anything else (a `TypeError` naming what it was), rather than writing its `str()`.
 
-Every launch is a new run in a new folder, named after its question and a run id:
-`<label>-<digest>-<YYYYMMDD-HHMMSS>-<4 hex>`. The digest is of the system, its options and the question, so
-runs of one question sort together. `plan(..., resume=<a run's name>)` continues that run instead, skipping
+Every launch is a new run in a new folder, named after its system and a run id: `<label>-<YYYYMMDD-HHMMSS>-<4
+hex>`. Which runs ask one question is in their settings.json, not their names. `plan(..., resume=<a run's name>)`
+continues that run instead, skipping
 every row that already has a record, so no answer is paid for twice; it refuses a run of another question
 (`sample=20` and the full dataset are two questions, as are `sample=6` and `limit=6`). A new run is never mixed
 with an old one: a hosted system redeployed since, or two launches at once, each get their own folder.

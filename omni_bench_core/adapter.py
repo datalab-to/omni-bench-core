@@ -86,8 +86,8 @@ class Adapter[I](abc.ABC):
             def call(self, page, *, timeout):
                 return adapter.Call(raw=subprocess.run([...], capture_output=True, text=True).stdout)
 
-    Its fields are its options: they are written to the run's settings.json and digested into its folder's
-    name, so one folder holds one configuration. `call` gets the task's input, never the row (which holds the
+    Its fields are its options: they are part of the run's question, which its settings.json keeps and a resume
+    must match, so one folder holds one configuration. `call` gets the task's input, never the row (which holds the
     gold), and is called from `workers` threads at once, so anything it shares must be thread-safe. A system whose
     answers come from a server we run subclasses `Served` instead, which adds what the server is to its options.
 
@@ -100,7 +100,7 @@ class Adapter[I](abc.ABC):
                          run but not part of its question (`asked`); none
         workers          rows in flight at once; 5
         retries          further attempts after a transient failure, `backoff` seconds apart; 3
-        label            the run folder's name before the digest; `name`
+        label            the run folder's name before its run id; `name`
         account_failure  whether a failure is the account's (stops the run); 401, 402 or `ACCOUNT_MARKERS`
         missing_keys     the `keys` not set; override when an option can stand in for a key
 
@@ -135,7 +135,7 @@ class Adapter[I](abc.ABC):
 
     @property
     def label(self) -> str:
-        """The run folder's name before the digest: `name`, or the model when one class stands for many models."""
+        """The run folder's name before its run id: `name`, or the model when one class stands for many models."""
         return self.name
 
     def account_failure(self, e: errors.SystemFailed) -> bool:

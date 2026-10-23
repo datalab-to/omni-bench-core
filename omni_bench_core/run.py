@@ -1,7 +1,7 @@
 """Runs: one system's answers, kept in a folder.
 
 - `Run`: the folder and the bookkeeping over it;
-- `stem` and `folder_name`: a run's folder name, from the question it answers and a new run id;
+- `identity` and `folder_name`: what a run answers, which a resume must match, and a new run's folder name;
 - `total`: recorded costs added up; and
 - `write_json`, `write_text` and `write_lines`: write a file whole, so a crash never leaves half a file.
 """
@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-import hashlib
 import json
 import logging
 import os
@@ -29,9 +28,10 @@ log = logging.getLogger(__name__)
 class Run:
     """One system's answers to one question, kept in a folder, and the system that predicts into it.
 
-    The question is the system and its options, the dataset, manifest and task, and the choice of rows. The
-    folder is named after it and a run id (`folder_name`): every launch is a new run in a new folder, and only a
-    launch that names this folder (`resume`) continues it, and only for the same question. The folder holds:
+    The question is the system and its options, the dataset, manifest and task, and the choice of rows
+    (`identity`), kept in settings.json. The folder is named after the system and a run id (`folder_name`): every
+    launch is a new run in a new folder, and only a launch that names this folder (`resume`) continues it, and only
+    for the same question. The folder holds:
 
         <folder>/
           settings.json           the question, the timeout, and the launch (when, and what the caller added)
@@ -124,8 +124,7 @@ class Run:
         self.predictions.mkdir(parents=True, exist_ok=True)
         self.records.mkdir(parents=True, exist_ok=True)
         started = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
-        write_json(self.folder / "settings.json", {"run": self.name, "system": self.system.name,
-                                                   "options": self.system.asked(), **question,
+        write_json(self.folder / "settings.json", {"run": self.name, **identity(self.system, question),
                                                    **({"dataset_commit": dataset_commit} if dataset_commit else {}), "timeout_s": timeout,
                                                    **self._located(),
                                                    "started": started, "launch": dict(launch or {})})
@@ -225,17 +224,16 @@ def _spelled(x: Any) -> str:
     return f"{x.get('name')}" + (f" ({opts})" if opts else "")
 
 
-def stem(system: adapter.Adapter, question: Mapping[str, Any]) -> str:
-    """What every run of `system` on `question` is named first: its `label`, then a digest of the system, every
-    option and the question. Runs of one question share it, so they sort together."""
+def identity(system: adapter.Adapter, question: Mapping[str, Any]) -> dict[str, Any]:
+    """What a run of `system` on `question` answers, as its settings.json keeps it: the system, every option but
+    where it is (`Adapter.asked`), and the question. A resume must match it exactly."""
     # Note: every option, not only those that differ from the defaults, since a default can change.
-    spelled = json.dumps({"system": system.name, "options": system.asked(), **question}, sort_keys=True)
-    return f"{re.sub(r'[^A-Za-z0-9._-]+', '_', system.label)}-{hashlib.sha256(spelled.encode()).hexdigest()[:8]}"
+    return {"system": system.name, "options": system.asked(), **question}
 
 
-def folder_name(system: adapter.Adapter, question: Mapping[str, Any], id: str) -> str:
-    """The folder name of one run of `system` on `question`: its `stem`, then the run id."""
-    return f"{stem(system, question)}-{id}"
+def folder_name(system: adapter.Adapter, id: str) -> str:
+    """The folder name of one run of `system`: its `label`, then the run id (its time and 4 hex)."""
+    return f"{re.sub(r'[^A-Za-z0-9._-]+', '_', system.label)}-{id}"
 
 
 def new_id() -> str:
