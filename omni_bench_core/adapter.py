@@ -1,10 +1,11 @@
 """Adapters: how systems are reached, and the rules every call follows.
 
-- `Adapter`: the class to subclass for a system;
+- `Adapter`: the class to subclass for a system, and `Served`, for one whose answers come from a server we run;
 - `Call` and `Cost`: what `Adapter.call` returns;
 - `Budget`, `PollRetry` and `reading`: helpers for writing `call` and `read`;
 - `predict`, `record` and `reread`: one row's call under the rules, and its record;
-- `configure`: an adapter or a scorer from a config's options, checked; and
+- `configure`: an adapter or a scorer from a config's options, checked;
+- `check_served`: a served system's server, checked against what its `served` says; and
 - `retryable`: whether a recorded failure may succeed in a later run.
 """
 
@@ -24,6 +25,7 @@ from typing import Any, ClassVar, NamedTuple, final
 from omni_bench_core import errors
 
 DEFAULT_TIMEOUT = 1800.0
+SERVER_TIMEOUT = 60.0  # seconds a server has to say what it serves
 # Phrases systems use for an account that can't pay, when the HTTP status doesn't say so.
 ACCOUNT_MARKERS = ("exceeded the maximum number of credits", "subscription has expired", "insufficient_quota",
                    "insufficient credits")
@@ -84,18 +86,21 @@ class Adapter[I](abc.ABC):
             def call(self, page, *, timeout):
                 return adapter.Call(raw=subprocess.run([...], capture_output=True, text=True).stdout)
 
-    Its fields are its options: they are written to the run's settings.json and digested into its folder's
-    name, so one folder holds one configuration. `call` gets the task's input, never the row (which holds the
-    gold), and is called from `workers` threads at once, so anything it shares must be thread-safe.
+    Its fields are its options: they are part of the run's question, which its settings.json keeps and a resume
+    must match, so one folder holds one configuration. `call` gets the task's input, never the row (which holds the
+    gold), and is called from `workers` threads at once, so anything it shares must be thread-safe. A system whose
+    answers come from a server we run subclasses `Served` instead, which adds what the server is to its options.
 
     Optional, with defaults:
 
         name             the name configs and run folders use; the class's name in snake case
         read             the output in a raw answer; the raw answer itself
         keys             the environment variables it needs, checked before any call; none
+        located          the options that say where the system is, not what it is (an address): recorded with the
+                         run but not part of its question (`asked`); none
         workers          rows in flight at once; 5
         retries          further attempts after a transient failure, `backoff` seconds apart; 3
-        label            the run folder's name before the digest; `name`
+        label            the run folder's name before its run id; `name`
         account_failure  whether a failure is the account's (stops the run); 401, 402 or `ACCOUNT_MARKERS`
         missing_keys     the `keys` not set; override when an option can stand in for a key
 
@@ -106,6 +111,7 @@ class Adapter[I](abc.ABC):
 
     name: ClassVar[str]
     keys: ClassVar[tuple[str, ...]] = ()
+    located: ClassVar[tuple[str, ...]] = ()
     workers: ClassVar[int] = 5
     retries: ClassVar[int] = 3
     backoff: ClassVar[tuple[float, ...]] = (20.0, 60.0, 120.0)
@@ -129,7 +135,7 @@ class Adapter[I](abc.ABC):
 
     @property
     def label(self) -> str:
-        """The run folder's name before the digest: `name`, or the model when one class stands for many models."""
+        """The run folder's name before its run id: `name`, or the model when one class stands for many models."""
         return self.name
 
     def account_failure(self, e: errors.SystemFailed) -> bool:
@@ -144,11 +150,68 @@ class Adapter[I](abc.ABC):
 
     @final
     def options(self) -> dict[str, Any]:
-        """The adapter's options, as its run's settings.json and records state them."""
+        """The adapter's options, as its records state them."""
         errors.check_dataclass(type(self), Adapter)
         out = dataclasses.asdict(self)
         errors.plain(out, f"{type(self).__name__}'s options")
         return out
+
+    @final
+    def asked(self) -> dict[str, Any]:
+        """The options that are part of a run's question: all but those that say where the system is (`located`)."""
+        return {k: v for k, v in self.options().items() if k not in self.located}
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Served[I](Adapter[I]):
+    """A system whose answers come from a server we run (a model served by vLLM, or a pipeline's server), not a
+    vendor's. How the model is served decides its answers as much as how it is asked, so it is an option:
+
+        served   what the server is: its weights, their revision, its software and its flags, such as
+                 {weights: org/model, revision: <commit>, vllm: 0.20.1, args: [--max-model-len 131072]}; its keys
+                 are the server's own
+
+    and part of the run's question, so two servings of a model are two runs, and a run is never resumed against
+    another one. Where the server is, `base_url`, is not part of it (`located`): the same model served beside a run or
+    at an endpoint asks the same question. `server` asks the server what it serves; before any call, a run refuses a server that says
+    something other than `served` about any key it reports, and a key of `served` the server doesn't report
+    unless the class names it in `stated` (`check_served`). A stated key (vLLM's flags, which vLLM can't report)
+    is true when the server was started from `served`, and is the config's word otherwise."""
+
+    stated: ClassVar[tuple[str, ...]] = ()
+    located: ClassVar[tuple[str, ...]] = ("base_url",)
+    served: dict[str, Any]
+    base_url: str
+
+    @abc.abstractmethod
+    def server(self, *, timeout: float) -> dict[str, Any]:
+        """What the server this adapter calls says it serves, such as {weights, revision, vllm}: the keys it can
+        report, each as `served` states it."""
+
+
+def check_served(a: Adapter, *, timeout: float = SERVER_TIMEOUT) -> None:
+    """Refuses a served system whose server says something other than its `served` about any key the server
+    reports, before any call. A system that isn't `Served` passes."""
+    if not isinstance(a, Served): return
+    try:
+        got = a.server(timeout=timeout)
+    except Exception as exc:
+        if errors.refused(exc) and not getattr(exc, "__notes__", None):
+            exc.add_note(f"{a.label} couldn't ask its server what it serves: the connection was refused. Start the "
+                         "server (or give its base_url), then run again")
+        raise
+    if not isinstance(got, dict):
+        raise TypeError(f"{type(a).__name__}.server must return a dict, not a {type(got).__name__}")
+    errors.plain(got, f"what {a.label}'s server says it serves")
+    if wrong := [k for k, v in got.items() if k not in a.served or a.served[k] != v]:
+        raise ValueError(f"{a.label}'s server serves something other than its served says: "
+                         + "; ".join(f"{k} is {got[k]!r} there and {a.served.get(k, '(not given)')!r} in served"
+                                     for k in wrong)
+                         + ". Serve what served says, or say in served what the server serves")
+    if unknown := sorted(set(a.served) - set(got) - set(a.stated)):
+        raise ValueError(f"{a.label}'s served says {', '.join(unknown)}, which its server doesn't report and "
+                         f"{type(a).__name__} doesn't take as stated; its server reports {', '.join(got) or 'nothing'}"
+                         + (f", and it takes {', '.join(a.stated)} as stated" if a.stated else ""))
 
 
 class Budget:
@@ -225,6 +288,9 @@ def configure[A](cls: type[A], options: Mapping[str, Any] | None = None) -> A:
         raise ValueError(f"{cls.name} has no option {unknown[0]!r}"
                          + (f" (did you mean {near[0]!r}?)" if near else "")
                          + f"; its options are: {', '.join(fields) or '(none)'}")
+    if needed := [f.name for f in dataclasses.fields(cls) if f.name not in options and f.init
+                  and f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING]:
+        raise ValueError(f"{cls.name} needs its {', '.join(needed)}, an option with no default; give it")
     hints = typing.get_type_hints(cls)
     for k, v in options.items():
         errors.plain(v, f"{cls.name}'s option {k} ({v!r})")

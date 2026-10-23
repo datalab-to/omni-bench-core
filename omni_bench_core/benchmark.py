@@ -10,6 +10,7 @@ from __future__ import annotations
 import collections
 import concurrent.futures as cf
 import dataclasses
+import json
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -137,24 +138,28 @@ class Benchmark:
         q = self.question(selection)
         self._inputs(chosen)
         for s in self.scorers: s.check_gold(every)
-        folder = Path(out) / (self._resumed(system, q, Path(out), resume) if resume is not None
-                              else runs.folder_name(system, q, runs.new_id()))
+        # Note: what the run answers, built for a new run too, so an option that isn't plain JSON is refused here.
+        asks = runs.identity(system, q)
+        # Note: after the checks that cost nothing, so a wrong dataset is refused without a server.
+        adapter.check_served(system)
+        folder = Path(out) / (self._resumed(asks, Path(out), resume) if resume is not None
+                              else runs.folder_name(system, runs.new_id()))
         return Plan(runs.Run(folder, system), q, chosen, timeout, workers or type(system).workers, retry_failed,
                     launch)
 
-    def _resumed(self, system: adapter.Adapter, q: Mapping[str, Any], out: Path, resume: str) -> str:
+    def _resumed(self, asks: Mapping[str, Any], out: Path, resume: str) -> str:
         """The name of the run to resume, checked: a folder under `out` that a launch of this same question made."""
         if not isinstance(resume, str) or not resume or "/" in resume or "\\" in resume:
             raise ValueError(f"resume is {resume!r}; give a run's name, the last part of its folder")
         if not (out / resume / "settings.json").is_file():
             raise ValueError(f"no run {resume} under {out}; give the name of a run folder there")
-        if not resume.startswith(stem := runs.stem(system, q) + "-"):
-            said = runs.Run(out / resume).settings()
-            now = {"system": system.name, "options": system.options(), **q}
-            differ = [k for k in now if said.get(k) != now[k]]
-            raise ValueError(f"{resume} answers another question than this launch; it differs in "
-                             f"{', '.join(differ) or 'the question'}. Resume it with the same system, options, "
-                             f"dataset and rows, or leave out resume for a new run (its name starts {stem})")
+        said = runs.Run(out / resume).settings()
+        # Note: through JSON, as settings.json keeps it, so a tuple and its list are one question.
+        now = json.loads(json.dumps(asks))
+        if differ := [k for k in now if said.get(k) != now[k]]:
+            raise ValueError(f"{resume} answers another question than this launch; it differs in {', '.join(differ)}. "
+                             "Resume it with the same system, options, dataset and rows, or leave out resume for a "
+                             "new run")
         return resume
 
     def check(self) -> dict[str, int]:

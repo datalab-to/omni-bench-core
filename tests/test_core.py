@@ -229,8 +229,7 @@ def test_each_launch_is_a_new_run_and_resume_continues_only_the_same_question(tm
     b = bench(dataset(tmp / "d"))
     one = b.run(GoldEcho(), tmp / "runs", launch={"by": "me", "commit": "abc"})["run"]
     two = b.run(GoldEcho(), tmp / "runs")["run"]
-    stem = runs.stem(GoldEcho(), b.question())
-    assert one != two and one.startswith(stem + "-") and two.startswith(stem + "-"), (one, two)
+    assert one != two and one.startswith("gold_echo-") and two.startswith("gold_echo-"), (one, two)
     said = json.loads((tmp / "runs" / one / "settings.json").read_text())
     assert said["launch"] == {"by": "me", "commit": "abc"} and said["started"].endswith("+00:00"), said
     CALLS.clear()
@@ -339,9 +338,9 @@ def test_refused_before_any_call(tmp: Path) -> None:
     refused(adapter.configure, Exact, {"strict": True}, match="exact has no option 'strict'")
     refused(adapter.configure, Doc, {}, match="an adapter or a scorer")
     q = b.question()
-    name = functools.partial(runs.stem, question=q)
-    assert name(Copy()) == name(Copy(temperature=0.0)) != name(Copy(upper=True))
-    assert runs.stem(Copy(), q) != runs.stem(Copy(), b.question({"sample": 2}))
+    asks = functools.partial(runs.identity, question=q)
+    assert asks(Copy()) == asks(Copy(temperature=0.0)) != asks(Copy(upper=True))
+    assert runs.identity(Copy(), q) != runs.identity(Copy(), b.question({"sample": 2}))
     refused(b.plan, [Copy()], tmp / "runs", match="not one adapter instance")
     refused(b.plan, GoldEcho(), tmp / "runs", workers=-1, match="workers is -1")
     refused(benchmark.Benchmark, Copying(), tmp / "ok", (), match="at least one scorer")
@@ -597,7 +596,7 @@ class CopyingTwice(Copying):
 def test_another_task_is_another_folder(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"))
     other = benchmark.Benchmark(CopyingTwice(), tmp / "d", [Exact()])
-    assert runs.stem(GoldEcho(), b.question()) != runs.stem(GoldEcho(), other.question())
+    assert runs.identity(GoldEcho(), b.question()) != runs.identity(GoldEcho(), other.question())
     name = b.run(GoldEcho(), tmp / "runs")["run"]
     refused(other.grade, tmp / "runs" / name, match="answers task")
     assert json.loads((tmp / "runs" / name / "settings.json").read_text())["task"] == {"name": "copying", "options": {}}
@@ -966,7 +965,7 @@ def test_progress_lines_say_failed_and_cost(tmp: Path) -> None:
 def test_a_dataset_name_makes_one_question_wherever_the_data_is_read(tmp: Path) -> None:
     here, there = dataset(tmp / "here"), dataset(tmp / "there")      # one dataset, read from two places
     named = [benchmark.Benchmark(Copying(), d, [Exact()], dataset_name="texts") for d in (here, there)]
-    assert len({runs.stem(Copy(), b.question()) for b in named}) == 1
+    assert named[0].question() == named[1].question()
     assert named[0].question()["dataset"] == "texts"
     assert bench(here).question()["dataset"] != bench(there).question()["dataset"]     # without it, the address
     refused(benchmark.Benchmark, Copying(), here, [Exact()], dataset_name=" ", match="dataset_name is ' '")
@@ -995,6 +994,68 @@ def test_options_from_a_config_are_the_types_the_adapter_takes(tmp: Path) -> Non
     option, which a config can't say, is refused."""
     assert adapter.configure(Stops, {"stops": ["a", "b"]}) == Stops(stops=("a", "b"))
     refused(adapter.configure, Nested, {"inner": {"a": 2}}, match="option inner is a Inner, a dataclass")
+
+
+SERVER: dict[str, Any] = {}   # what ServedCopy's server says it serves
+
+
+@dataclasses.dataclass(frozen=True)
+class ServedCopy(adapter.Served):
+    """Copies the file's text, as a model served by us would answer; its server says it serves `SERVER`."""
+
+    name: ClassVar[str] = "served_copy"
+    stated: ClassVar[tuple[str, ...]] = ("args",)
+
+    def call(self, x: Path, *, timeout: float) -> adapter.Call:
+        return adapter.Call(raw={"answer": x.read_text()})
+
+    def read(self, raw: Any, x: Path) -> Any:
+        with adapter.reading("the answer"):
+            return {"text": raw["answer"]}
+
+    def server(self, *, timeout: float) -> dict[str, Any]:
+        if not SERVER: raise ConnectionRefusedError("nothing listens")
+        return dict(SERVER)
+
+
+def test_how_a_model_is_served_is_part_of_the_question_and_checked_before_any_call(tmp: Path) -> None:
+    """Two servings of one model are two runs; a server that serves something other than `served` says is refused
+    before any call, as is one that isn't running; `served` is required."""
+    b = bench(dataset(tmp / "d"))
+    one = {"weights": "org/m", "revision": "a" * 40, "vllm": "0.20.1", "args": ["--max-model-len 8192"]}
+    SERVER.update(weights="org/m", revision="a" * 40, vllm="0.20.1")
+    p = b.plan(ServedCopy(base_url="http://a", served=one), tmp / "runs")
+    q = b.question()
+    assert runs.identity(ServedCopy(base_url="http://a", served=one), q) != runs.identity(
+        ServedCopy(base_url="http://a", served={**one, "args": ["--max-model-len 4096"]}), q)
+    assert runs.identity(ServedCopy(base_url="http://a", served=one), q) == runs.identity(
+        ServedCopy(base_url="http://b", served=one), q)
+    b.predict(p)
+    assert b.grade(p.run)["scorers"]["exact"]["headline"] == 1.0
+    said = json.loads((p.run.folder / "settings.json").read_text())
+    assert said["options"]["served"] == one and "base_url" not in said["options"], said
+    assert said["located"] == {"base_url": "http://a"}, said
+    # where the server is isn't the question: the same model at another address resumes the same run, and says so
+    elsewhere = ServedCopy(base_url="http://b", served=one)
+    assert b.plan(elsewhere, tmp / "runs", resume=p.run.name).run.folder == p.run.folder
+    b.predict(b.plan(elsewhere, tmp / "runs", resume=p.run.name))
+    assert json.loads((p.run.folder / "settings.json").read_text())["located"] == {"base_url": "http://b"}
+    SERVER.update(revision="b" * 40)
+    refused(b.plan, ServedCopy(base_url="http://a", served={**one, "revision": "b" * 40}), tmp / "runs", resume=p.run.name,
+            match="answers another question")
+    said = refused(b.plan, ServedCopy(base_url="http://a", served=one), tmp / "runs", match="serves something other than its served says")
+    assert f"revision is {'b' * 40!r} there and {'a' * 40!r} in served" in said, said
+    SERVER.update(revision="a" * 40, quantization="fp8")
+    refused(b.plan, ServedCopy(base_url="http://a", served=one), tmp / "runs", match="quantization is 'fp8' there and '(not given)'")
+    SERVER.pop("quantization")
+    refused(b.plan, ServedCopy(base_url="http://a", served={**one, "revison": "a" * 40}), tmp / "runs", match="says revison, which its server")
+    SERVER.clear()
+    try:
+        b.plan(ServedCopy(base_url="http://a", served=one), tmp / "runs")
+        raise AssertionError("a server that isn't running was not refused")
+    except ConnectionRefusedError as exc:
+        assert "couldn't ask its server what it serves" in exc.__notes__[0], exc.__notes__
+    refused(adapter.configure, ServedCopy, {"base_url": "http://a"}, match="needs its served")
 
 
 def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -> None:
