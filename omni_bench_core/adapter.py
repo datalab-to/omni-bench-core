@@ -165,9 +165,11 @@ class Served[I](Adapter[I]):
 
     and part of the run's question, so two servings of a model are two runs, and a run is never resumed against
     another one. `server` asks the server what it serves; before any call, a run refuses a server that says
-    something other than `served` about any key it reports (`check_served`). What a server can't report (its
-    flags, often) is true when its serve folder started it from `served`, and is the config's word otherwise."""
+    something other than `served` about any key it reports, and a key of `served` the server doesn't report
+    unless the class names it in `stated` (`check_served`). A stated key (vLLM's flags, which vLLM can't report)
+    is true when the server was started from `served`, and is the config's word otherwise."""
 
+    stated: ClassVar[tuple[str, ...]] = ()
     served: dict[str, Any]
 
     @abc.abstractmethod
@@ -195,6 +197,10 @@ def check_served(a: Adapter, *, timeout: float = SERVER_TIMEOUT) -> None:
                          + "; ".join(f"{k} is {got[k]!r} there and {a.served.get(k, '(not given)')!r} in served"
                                      for k in wrong)
                          + ". Serve what served says, or say in served what the server serves")
+    if unknown := sorted(set(a.served) - set(got) - set(a.stated)):
+        raise ValueError(f"{a.label}'s served says {', '.join(unknown)}, which its server doesn't report and "
+                         f"{type(a).__name__} doesn't take as stated; its server reports {', '.join(got) or 'nothing'}"
+                         + (f", and it takes {', '.join(a.stated)} as stated" if a.stated else ""))
 
 
 class Budget:

@@ -1005,6 +1005,7 @@ class ServedCopy(adapter.Served):
     """Copies the file's text, as a model served by us would answer; its server says it serves `SERVER`."""
 
     name: ClassVar[str] = "served_copy"
+    stated: ClassVar[tuple[str, ...]] = ("args",)
 
     def call(self, x: Path, *, timeout: float) -> adapter.Call:
         return adapter.Call(raw={"answer": x.read_text()})
@@ -1037,6 +1038,8 @@ def test_how_a_model_is_served_is_part_of_the_question_and_checked_before_any_ca
     assert f"revision is {'b' * 40!r} there and {'a' * 40!r} in served" in said, said
     SERVER.update(revision="a" * 40, quantization="fp8")
     refused(b.plan, ServedCopy(served=one), tmp / "runs", match="quantization is 'fp8' there and '(not given)'")
+    SERVER.pop("quantization")
+    refused(b.plan, ServedCopy(served={**one, "revison": "a" * 40}), tmp / "runs", match="says revison, which its server")
     SERVER.clear()
     try:
         b.plan(ServedCopy(served=one), tmp / "runs")

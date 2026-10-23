@@ -179,6 +179,8 @@ class MyModel(adapter.Served):
     base_url: str = "http://127.0.0.1:8000"
 
     def call(self, x, *, timeout): ...
+    stated = ("args",)                      # what vLLM can't report about itself: taken as served says
+
     def server(self, *, timeout):           # what the server says it serves, such as {weights, revision, vllm}
         return httpx.get(f"{self.base_url}/served", timeout=timeout).json()
 
