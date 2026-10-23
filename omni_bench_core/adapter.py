@@ -186,13 +186,19 @@ class Served[I](Adapter[I]):
     @abc.abstractmethod
     def server(self, *, timeout: float) -> dict[str, Any]:
         """What the server this adapter calls says it serves, such as {weights, revision, vllm}: the keys it can
-        report, each as `served` states it."""
+        report, each as `served` states it. Compared with `served` before any call."""
+
+    def details(self, *, timeout: float) -> dict[str, Any]:
+        """Anything else the server says about itself, such as vLLM's whole engine config: recorded with the run, in its
+        server.json, and never compared. Nothing, unless the adapter says how to ask."""
+        return {}
 
 
-def check_served(a: Adapter, *, timeout: float = SERVER_TIMEOUT) -> None:
+def check_served(a: Adapter, *, timeout: float = SERVER_TIMEOUT) -> dict[str, Any] | None:
     """Refuses a served system whose server says something other than its `served` about any key the server
-    reports, before any call. A system that isn't `Served` passes."""
-    if not isinstance(a, Served): return
+    reports, before any call. Returns what the server said, `{"server": ..., "details": ...}`, for the run to record;
+    None for a system that isn't `Served`."""
+    if not isinstance(a, Served): return None
     try:
         got = a.server(timeout=timeout)
     except Exception as exc:
@@ -212,6 +218,11 @@ def check_served(a: Adapter, *, timeout: float = SERVER_TIMEOUT) -> None:
         raise ValueError(f"{a.label}'s served says {', '.join(unknown)}, which its server doesn't report and "
                          f"{type(a).__name__} doesn't take as stated; its server reports {', '.join(got) or 'nothing'}"
                          + (f", and it takes {', '.join(a.stated)} as stated" if a.stated else ""))
+    details = a.details(timeout=timeout)
+    if not isinstance(details, dict):
+        raise TypeError(f"{type(a).__name__}.details must return a dict, not a {type(details).__name__}")
+    errors.plain(details, f"what {a.label}'s server says about itself")
+    return {"server": got, "details": details}
 
 
 class Budget:

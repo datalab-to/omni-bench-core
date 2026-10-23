@@ -35,6 +35,7 @@ class Run:
 
         <folder>/
           settings.json           the question, the timeout, and the launch (when, and what the caller added)
+          server.json             for a served system: what its server said at each launch (`served_by`)
           records/<id>.json       everything `adapter.predict` returned for each row: the source of truth
           predictions/<id>.json   each row's output alone, which is all grading reads
           <scorer>/               each scorer's scores.jsonl, summary.json and details/
@@ -128,6 +129,16 @@ class Run:
                                                    **({"dataset_commit": dataset_commit} if dataset_commit else {}), "timeout_s": timeout,
                                                    **self._located(),
                                                    "started": started, "launch": dict(launch or {})})
+
+    def served_by(self, said: Mapping[str, Any]) -> None:
+        """Appends what a served system's server said at this launch (`adapter.check_served`) to server.json, with
+        when and where it was: `{"launches": [{"started", "located", "server", "details"}, ...]}`. One entry a
+        launch, since a resume may meet another machine; the server's identity is checked the same at each."""
+        path = self.folder / "server.json"
+        before = json.loads(path.read_text())["launches"] if path.is_file() else []
+        now = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
+        entry = {"started": now, "located": self._located().get("located", {}), **said}
+        write_json(path, {"launches": [*before, entry]})
 
     def _located(self) -> dict[str, Any]:
         """Where the system is, as of the latest launch (its `located` options), when it says: `{"located": {...}}`."""
