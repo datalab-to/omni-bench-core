@@ -187,11 +187,11 @@ def write(c: Config, s: adapter.Adapter, folder: str | Path) -> Path:
 
 
 def template(make: Callable[[str, dict[str, Any]], adapter.Adapter], name: str, *, dataset: str, manifest: str,
-             scorers: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
+             scorers: Mapping[str, dict[str, Any]], timeout: float) -> dict[str, Any]:
     """A config to start from: system `name` at its defaults (built by `make`, so every option is written out), on
-    `dataset`'s `manifest`, graded by `scorers`, every row, an 1800 s timeout and the system's own workers."""
+    `dataset`'s `manifest`, graded by `scorers`, every row, `timeout` seconds each and the system's own workers."""
     s = make(name, {})
     return {"dataset": dataset, "manifest": manifest, "scorers": dict(scorers),
-            "rows": {"sample": 0, "limit": 0, "only": None}, "timeout": 1800.0, "workers": 0,
+            "rows": {"sample": 0, "limit": 0, "only": None}, "timeout": float(timeout), "workers": 0,
             "system": {name: s.options()}}
 

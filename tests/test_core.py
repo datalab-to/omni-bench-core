@@ -995,7 +995,7 @@ def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -
     assert kept.rows.limit == 3 and kept.system == {"copy": s.options()}
     assert config.plan(kept, b, s, tmp / "runs", resume=p.run.name).run.folder == p.run.folder
     # a template writes every option of the system, at its defaults
-    t = config.template(make, "copy", dataset="d", manifest="manifest.parquet", scorers={"exact": {}})
+    t = config.template(make, "copy", dataset="d", manifest="manifest.parquet", scorers={"exact": {}}, timeout=60)
     assert config.parse(t, "t").system == {"copy": Copy().options()}
     for bad, sets, match in (
         ({k: v for k, v in good.items() if k != "rows"}, [], "rows: missing"),
