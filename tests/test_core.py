@@ -972,6 +972,81 @@ def test_a_dataset_name_makes_one_question_wherever_the_data_is_read(tmp: Path) 
     refused(benchmark.Benchmark, Copying(), here, [Exact()], dataset_name=" ", match="dataset_name is ' '")
 
 
+
+@dataclasses.dataclass(frozen=True)
+class Inner:
+    a: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Stops(Copy):
+    name: ClassVar[str] = "stops"
+    stops: tuple[str, ...] = ("x",)
+
+
+@dataclasses.dataclass(frozen=True)
+class Nested(Copy):
+    name: ClassVar[str] = "nested"
+    inner: Inner = dataclasses.field(default_factory=Inner)
+
+
+def test_options_from_a_config_are_the_types_the_adapter_takes(tmp: Path) -> None:
+    """A config's list is a tuple option's tuple, so the adapter is the one its class describes; a nested dataclass
+    option, which a config can't say, is refused."""
+    assert adapter.configure(Stops, {"stops": ["a", "b"]}) == Stops(stops=("a", "b"))
+    refused(adapter.configure, Nested, {"inner": {"a": 2}}, match="option inner is a Inner, a dataclass")
+
+
+def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -> None:
+    import os
+
+    import yaml
+
+    from omni_bench_core import config
+
+    def make(name, opts):
+        if name != "copy": raise ValueError(f"no system {name!r}; the systems are copy")
+        return adapter.configure(Copy, opts)
+
+    good = {"dataset": str(dataset(tmp / "d")), "manifest": "manifest.parquet", "scorers": {"exact": {}},
+            "rows": {"sample": 0, "limit": 2, "only": None}, "timeout": 60.0, "workers": 1, "system": {"copy": {}}}
+    (path := tmp / "c.yaml").write_text(yaml.safe_dump(good))
+    c = config.load(path, ["rows.limit=3"])
+    b, s = config.benchmark(c, Copying(), {"exact": Exact}), config.system(c, make)
+    p = config.plan(c, b, s, tmp / "runs")
+    assert len(p.rows) == 3 and p.timeout == 60.0 and p.workers == 1
+    b.predict(p)
+    # the run keeps its config resolved, and loading it again asks the same question
+    kept = config.load(config.write(c, b, s, p.run.folder))
+    assert kept.rows.limit == 3 and kept.system == {"copy": s.options()} and kept.scorers == {"exact": Exact().options()}
+    assert config.plan(kept, b, s, tmp / "runs", resume=p.run.name).run.folder == p.run.folder
+    # a dataset folder is kept as its full path, so the config reads the same folder from anywhere
+    rel = config.parse({**good, "dataset": os.path.relpath(good["dataset"])}, "rel")
+    assert config.resolved(rel, b, s)["dataset"] == str(Path(good["dataset"]).resolve())
+    # a template writes every option of the system, at its defaults
+    t = config.template(make, "copy", dataset="d", manifest="manifest.parquet", scorers={"exact": {}}, timeout=60)
+    assert config.parse(t, "t").system == {"copy": Copy().options()}
+    for bad, sets, match in (
+        ({k: v for k, v in good.items() if k != "rows"}, [], "rows: missing"),
+        ({**good, "benchmark": "x"}, [], "benchmark: not a key a config has"),
+        ({**good, "timeout": 0}, [], "timeout: Input should be greater than 0; it is 0"),
+        ({**good, "system": {"a": {}, "b": {}}}, [], "system is one system"),
+        (good, ["rows.limt=3"], "did you mean rows.limit"),
+        (good, ["rows.limit"], "write path=value"),
+    ):
+        path.write_text(yaml.safe_dump(bad))
+        refused(config.load, path, sets, match=match)
+    refused(config.scorers, config.parse({**good, "scorers": {"nope": {}}}, "x"), {"exact": Exact}, match="no scorer 'nope'")
+    refused(config.system, config.parse({**good, "system": {"nope": {}}}, "x"), make, match="no system 'nope'")
+    refused(config.apply, {"system": {"m": {True: 1}}}, ["system.m.on=2"], match="system.m has True")
+    refused(config.apply, {"system": {"m.x": {"v": 1}, "m": {"x": {"v": 2}}}}, ["system.m.x.v=5"], match="could be read as")
+    refused(config.apply, {"scorers": {"e": [{"x": 1}]}}, ["scorers.e.0.x=2"], match="scorers.e is a list")
+    refused(config.parse, {**good, "scorers": {"exact": 5}}, "x", match="scorers.exact is 5; give its options")
+    refused(config.parse, {**good, "rows": {**good["rows"], "only": [83]}}, "x", match="quote it")
+    dotted = {"system": {"org/model-1.5": {"x": {"y": 1}}}}
+    assert config.apply(dotted, ["system.org/model-1.5.x.y=2"]) == {"system": {"org/model-1.5": {"x": {"y": 2}}}}
+
+
 if __name__ == "__main__":
     for name, f in list(globals().items()):
         if name.startswith("test_"):
