@@ -120,10 +120,12 @@ def apply(c: dict[str, Any], sets: list[str]) -> dict[str, Any]:
         path, eq, raw = s.partition("=")
         if not eq or not path:
             raise ValueError(f"--set {s!r}: write path=value, such as rows.sample=5")
-        node, keys = out, path.split(".")
-        for i, k in enumerate(keys):
-            if not isinstance(node, dict) or k not in node:
-                here = keys[:i]
+        node, here, rest = out, [], path.split(".")
+        while rest:
+            # Note: the longest key that matches, so a key with a dot in it (a model id) is reachable.
+            n = next((n for n in range(len(rest), 0, -1) if isinstance(node, dict) and ".".join(rest[:n]) in node), 0)
+            if not n:
+                k = rest[0]
                 have = sorted(node) if isinstance(node, dict) else []
                 near = difflib.get_close_matches(k, have, n=1)
                 raise ValueError(
@@ -131,10 +133,11 @@ def apply(c: dict[str, Any], sets: list[str]) -> dict[str, Any]:
                     + (f"; did you mean {'.'.join([*here, near[0]])}?" if near
                        else f"; {'.'.join(here) or 'it'} has {', '.join(have) or 'nothing'}")
                 )
-            if i == len(keys) - 1:
-                node[k] = yaml.safe_load(raw) if raw.strip() else ""
+            k, rest = ".".join(rest[:n]), rest[n:]
+            if rest:
+                node, here = node[k], [*here, k]
             else:
-                node = node[k]
+                node[k] = yaml.safe_load(raw) if raw.strip() else ""
     return out
 
 

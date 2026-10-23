@@ -1009,6 +1009,8 @@ def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -
         refused(config.load, path, sets, match=match)
     refused(config.scorers, config.parse({**good, "scorers": {"nope": {}}}, "x"), {"exact": Exact}, match="no scorer 'nope'")
     refused(config.system, config.parse({**good, "system": {"nope": {}}}, "x"), make, match="no system 'nope'")
+    dotted = {"system": {"org/model-1.5": {"x": {"y": 1}}}}
+    assert config.apply(dotted, ["system.org/model-1.5.x.y=2"]) == {"system": {"org/model-1.5": {"x": {"y": 2}}}}
 
 
 if __name__ == "__main__":
