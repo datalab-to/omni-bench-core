@@ -108,25 +108,33 @@ class Run:
     def prepare(self, question: Mapping[str, Any], dataset_commit: str | None, timeout: float,
                 launch: Mapping[str, Any] | None = None) -> None:
         """Makes the run's folders, and writes settings.json before the first call: the question, the dataset's
-        commit (`dataset_commit`, for an `hf://` dataset), the timeout, and the launch (`started`, UTC, and `launch`,
-        the caller's own record of it). A resumed run keeps its first launch's settings.json but the timeout, which
-        may change, and refuses a dataset whose commit changed since: its rows would be answered against two
+        commit (`dataset_commit`, for an `hf://` dataset), the timeout, where the system is (`located`), and the launch
+        (`started`, UTC, and `launch`, the caller's own record of it). A resumed run keeps its first launch's
+        settings.json but the timeout and where the system is, which may change, and refuses a dataset whose commit changed since: its rows would be answered against two
         versions of the data."""
         assert self.system is not None, "only a run with a system predicts"
         if (said := self.settings()):
             if (was := said.get("dataset_commit")) and dataset_commit and was != dataset_commit:
                 raise ValueError(f"{self.folder} was run on the dataset at commit {was}, and it is now at {dataset_commit}; "
                                  "start a new run (leave out resume)")
-            if said.get("timeout_s") != timeout:
-                write_json(self.folder / "settings.json", {**said, "timeout_s": timeout})
+            now = {"timeout_s": timeout, **self._located()}
+            if any(said.get(k) != v for k, v in now.items()):
+                write_json(self.folder / "settings.json", {**said, **now})
             return
         self.predictions.mkdir(parents=True, exist_ok=True)
         self.records.mkdir(parents=True, exist_ok=True)
         started = datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
         write_json(self.folder / "settings.json", {"run": self.name, "system": self.system.name,
-                                                   "options": self.system.options(), **question,
+                                                   "options": self.system.asked(), **question,
                                                    **({"dataset_commit": dataset_commit} if dataset_commit else {}), "timeout_s": timeout,
+                                                   **self._located(),
                                                    "started": started, "launch": dict(launch or {})})
+
+    def _located(self) -> dict[str, Any]:
+        """Where the system is, as of the latest launch (its `located` options), when it says: `{"located": {...}}`."""
+        assert self.system is not None
+        o = self.system.options()
+        return {"located": {k: o[k] for k in self.system.located}} if self.system.located else {}
 
     def record(self, id: str) -> dict[str, Any] | None:
         """The row's record, or None when it has none or the file can't be read."""
@@ -221,7 +229,7 @@ def stem(system: adapter.Adapter, question: Mapping[str, Any]) -> str:
     """What every run of `system` on `question` is named first: its `label`, then a digest of the system, every
     option and the question. Runs of one question share it, so they sort together."""
     # Note: every option, not only those that differ from the defaults, since a default can change.
-    spelled = json.dumps({"system": system.name, "options": system.options(), **question}, sort_keys=True)
+    spelled = json.dumps({"system": system.name, "options": system.asked(), **question}, sort_keys=True)
     return f"{re.sub(r'[^A-Za-z0-9._-]+', '_', system.label)}-{hashlib.sha256(spelled.encode()).hexdigest()[:8]}"
 
 

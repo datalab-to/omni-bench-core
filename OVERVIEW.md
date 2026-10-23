@@ -171,7 +171,8 @@ A system whose answers come from a server you run (a model served by vLLM, a pip
 `adapter.Served`. How a model is served decides its answers as much as how it is asked, so it is an option,
 `served`, and part of the run's question: its weights, their revision, its software and its flags. `server`
 asks the server what it serves, and before any call a run refuses a server that says otherwise about any key
-it reports:
+it reports. Where the server is, its `base_url`, is recorded but not part of the question (`located`), so the same
+model served beside a run or at a shared endpoint asks the same question:
 
 ```python
 @dataclasses.dataclass(frozen=True)

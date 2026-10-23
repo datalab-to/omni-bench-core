@@ -1025,28 +1025,35 @@ def test_how_a_model_is_served_is_part_of_the_question_and_checked_before_any_ca
     b = bench(dataset(tmp / "d"))
     one = {"weights": "org/m", "revision": "a" * 40, "vllm": "0.20.1", "args": ["--max-model-len 8192"]}
     SERVER.update(weights="org/m", revision="a" * 40, vllm="0.20.1")
-    p = b.plan(ServedCopy(served=one), tmp / "runs")
-    other = b.plan(ServedCopy(served={**one, "args": ["--max-model-len 4096"]}), tmp / "runs")
+    p = b.plan(ServedCopy(base_url="http://a", served=one), tmp / "runs")
+    other = b.plan(ServedCopy(base_url="http://a", served={**one, "args": ["--max-model-len 4096"]}), tmp / "runs")
     assert p.run.folder.name.split("-")[1] != other.run.folder.name.split("-")[1]
     b.predict(p)
     assert b.grade(p.run)["scorers"]["exact"]["headline"] == 1.0
-    assert json.loads((p.run.folder / "settings.json").read_text())["options"]["served"] == one
+    said = json.loads((p.run.folder / "settings.json").read_text())
+    assert said["options"]["served"] == one and "base_url" not in said["options"], said
+    assert said["located"] == {"base_url": "http://a"}, said
+    # where the server is isn't the question: the same model at another address resumes the same run, and says so
+    elsewhere = ServedCopy(base_url="http://b", served=one)
+    assert b.plan(elsewhere, tmp / "runs", resume=p.run.name).run.folder == p.run.folder
+    b.predict(b.plan(elsewhere, tmp / "runs", resume=p.run.name))
+    assert json.loads((p.run.folder / "settings.json").read_text())["located"] == {"base_url": "http://b"}
     SERVER.update(revision="b" * 40)
-    refused(b.plan, ServedCopy(served={**one, "revision": "b" * 40}), tmp / "runs", resume=p.run.name,
+    refused(b.plan, ServedCopy(base_url="http://a", served={**one, "revision": "b" * 40}), tmp / "runs", resume=p.run.name,
             match="answers another question")
-    said = refused(b.plan, ServedCopy(served=one), tmp / "runs", match="serves something other than its served says")
+    said = refused(b.plan, ServedCopy(base_url="http://a", served=one), tmp / "runs", match="serves something other than its served says")
     assert f"revision is {'b' * 40!r} there and {'a' * 40!r} in served" in said, said
     SERVER.update(revision="a" * 40, quantization="fp8")
-    refused(b.plan, ServedCopy(served=one), tmp / "runs", match="quantization is 'fp8' there and '(not given)'")
+    refused(b.plan, ServedCopy(base_url="http://a", served=one), tmp / "runs", match="quantization is 'fp8' there and '(not given)'")
     SERVER.pop("quantization")
-    refused(b.plan, ServedCopy(served={**one, "revison": "a" * 40}), tmp / "runs", match="says revison, which its server")
+    refused(b.plan, ServedCopy(base_url="http://a", served={**one, "revison": "a" * 40}), tmp / "runs", match="says revison, which its server")
     SERVER.clear()
     try:
-        b.plan(ServedCopy(served=one), tmp / "runs")
+        b.plan(ServedCopy(base_url="http://a", served=one), tmp / "runs")
         raise AssertionError("a server that isn't running was not refused")
     except ConnectionRefusedError as exc:
         assert "couldn't ask its server what it serves" in exc.__notes__[0], exc.__notes__
-    refused(adapter.configure, ServedCopy, {}, match="needs its served")
+    refused(adapter.configure, ServedCopy, {"base_url": "http://a"}, match="needs its served")
 
 
 def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -> None:

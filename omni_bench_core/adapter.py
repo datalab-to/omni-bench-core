@@ -96,6 +96,8 @@ class Adapter[I](abc.ABC):
         name             the name configs and run folders use; the class's name in snake case
         read             the output in a raw answer; the raw answer itself
         keys             the environment variables it needs, checked before any call; none
+        located          the options that say where the system is, not what it is (an address): recorded with the
+                         run but not part of its question (`asked`); none
         workers          rows in flight at once; 5
         retries          further attempts after a transient failure, `backoff` seconds apart; 3
         label            the run folder's name before the digest; `name`
@@ -109,6 +111,7 @@ class Adapter[I](abc.ABC):
 
     name: ClassVar[str]
     keys: ClassVar[tuple[str, ...]] = ()
+    located: ClassVar[tuple[str, ...]] = ()
     workers: ClassVar[int] = 5
     retries: ClassVar[int] = 3
     backoff: ClassVar[tuple[float, ...]] = (20.0, 60.0, 120.0)
@@ -147,11 +150,16 @@ class Adapter[I](abc.ABC):
 
     @final
     def options(self) -> dict[str, Any]:
-        """The adapter's options, as its run's settings.json and records state them."""
+        """The adapter's options, as its records state them."""
         errors.check_dataclass(type(self), Adapter)
         out = dataclasses.asdict(self)
         errors.plain(out, f"{type(self).__name__}'s options")
         return out
+
+    @final
+    def asked(self) -> dict[str, Any]:
+        """The options that are part of a run's question: all but those that say where the system is (`located`)."""
+        return {k: v for k, v in self.options().items() if k not in self.located}
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -164,13 +172,16 @@ class Served[I](Adapter[I]):
                  are the server's own
 
     and part of the run's question, so two servings of a model are two runs, and a run is never resumed against
-    another one. `server` asks the server what it serves; before any call, a run refuses a server that says
+    another one. Where the server is, `base_url`, is not part of it (`located`): the same model served beside a run or
+    at an endpoint asks the same question. `server` asks the server what it serves; before any call, a run refuses a server that says
     something other than `served` about any key it reports, and a key of `served` the server doesn't report
     unless the class names it in `stated` (`check_served`). A stated key (vLLM's flags, which vLLM can't report)
     is true when the server was started from `served`, and is the config's word otherwise."""
 
     stated: ClassVar[tuple[str, ...]] = ()
+    located: ClassVar[tuple[str, ...]] = ("base_url",)
     served: dict[str, Any]
+    base_url: str
 
     @abc.abstractmethod
     def server(self, *, timeout: float) -> dict[str, Any]:

@@ -152,7 +152,7 @@ class Benchmark:
             raise ValueError(f"no run {resume} under {out}; give the name of a run folder there")
         if not resume.startswith(stem := runs.stem(system, q) + "-"):
             said = runs.Run(out / resume).settings()
-            now = {"system": system.name, "options": system.options(), **q}
+            now = {"system": system.name, "options": system.asked(), **q}
             differ = [k for k in now if said.get(k) != now[k]]
             raise ValueError(f"{resume} answers another question than this launch; it differs in "
                              f"{', '.join(differ) or 'the question'}. Resume it with the same system, options, "
