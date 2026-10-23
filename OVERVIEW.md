@@ -172,7 +172,9 @@ A system whose answers come from a server you run (a model served by vLLM, a pip
 `served`, and part of the run's question: its weights, their revision, its software and its flags. `server`
 asks the server what it serves, and before any call a run refuses a server that says otherwise about any key
 it reports. Where the server is, its `base_url`, is recorded but not part of the question (`located`), so the same
-model served beside a run or at a shared endpoint asks the same question:
+model served beside a run or at a shared endpoint asks the same question. Anything else the server says about
+itself (`details`, such as vLLM's whole engine config) is recorded, launch by launch, in the run's server.json, and
+never compared:
 
 ```python
 @dataclasses.dataclass(frozen=True)
@@ -198,6 +200,7 @@ the answers: the system and its options, the dataset, the manifest, the task, an
   runs/copy-20261021-160012-3f9a/     <system label>-<time>-<4 hex>
     settings.json                     the question: system, options, dataset, manifest, task and rows; the
                                       dataset's commit; and the timeout
+    server.json                       for a served system: what its server said at each launch
     records/a1.json                   everything about one row's call: output, raw answer, error, cost
     predictions/a1.json               just the output; this is what grading reads
     exact/                            one folder per scorer

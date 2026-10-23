@@ -32,6 +32,7 @@ class Plan(NamedTuple):
     workers: int                     # rows in flight at once
     retry_failed: bool
     launch: Mapping[str, Any]        # the caller's record of the launch, kept in settings.json
+    server: Mapping[str, Any] | None = None   # what a served system's server said, kept in server.json
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,11 +142,11 @@ class Benchmark:
         # Note: what the run answers, built for a new run too, so an option that isn't plain JSON is refused here.
         asks = runs.identity(system, q)
         # Note: after the checks that cost nothing, so a wrong dataset is refused without a server.
-        adapter.check_served(system)
+        said = adapter.check_served(system)
         folder = Path(out) / (self._resumed(asks, Path(out), resume) if resume is not None
                               else runs.folder_name(system, runs.new_id()))
         return Plan(runs.Run(folder, system), q, chosen, timeout, workers or type(system).workers, retry_failed,
-                    launch)
+                    launch, said)
 
     def _resumed(self, asks: Mapping[str, Any], out: Path, resume: str) -> str:
         """The name of the run to resume, checked: a folder under `out` that a launch of this same question made."""
@@ -192,6 +193,7 @@ class Benchmark:
         factory returning one shared pool lets several runs share a rate limit."""
         r = p.run
         r.prepare(p.question, data.commit(self.dataset, data.download_dataset(self.dataset)), p.timeout, p.launch)
+        if p.server is not None: r.served_by(p.server)
         self._read_unread(r, p.rows)
         work = collections.deque(x for x in p.rows if r.needs(x.id, p.retry_failed))
         live: dict[cf.Future, data.Row] = {}

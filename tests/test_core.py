@@ -1017,6 +1017,9 @@ class ServedCopy(adapter.Served):
         if not SERVER: raise ConnectionRefusedError("nothing listens")
         return dict(SERVER)
 
+    def details(self, *, timeout: float) -> dict[str, Any]:
+        return {"engine": {"max_model_len": 8192, "dtype": "bfloat16"}}
+
 
 def test_how_a_model_is_served_is_part_of_the_question_and_checked_before_any_call(tmp: Path) -> None:
     """Two servings of one model are two runs; a server that serves something other than `served` says is refused
@@ -1040,6 +1043,14 @@ def test_how_a_model_is_served_is_part_of_the_question_and_checked_before_any_ca
     assert b.plan(elsewhere, tmp / "runs", resume=p.run.name).run.folder == p.run.folder
     b.predict(b.plan(elsewhere, tmp / "runs", resume=p.run.name))
     assert json.loads((p.run.folder / "settings.json").read_text())["located"] == {"base_url": "http://b"}
+    # what answered is kept a launch at a time: where the server was, what it is, and what else it says
+    launches = json.loads((p.run.folder / "server.json").read_text())["launches"]
+    assert [x["located"] for x in launches] == [{"base_url": "http://a"}, {"base_url": "http://b"}], launches
+    assert launches[0]["server"] == {"weights": "org/m", "revision": "a" * 40, "vllm": "0.20.1"}, launches
+    assert launches[0]["details"] == {"engine": {"max_model_len": 8192, "dtype": "bfloat16"}} and launches[0]["started"]
+    vendor = b.plan(Copy(), tmp / "runs")
+    b.predict(vendor)
+    assert not (vendor.run.folder / "server.json").exists(), "a system we don't serve has no server.json"
     SERVER.update(revision="b" * 40)
     refused(b.plan, ServedCopy(base_url="http://a", served={**one, "revision": "b" * 40}), tmp / "runs", resume=p.run.name,
             match="answers another question")
