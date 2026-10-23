@@ -358,6 +358,32 @@ Other things a benchmark does:
 - `b.check()`: checks the dataset (manifest, input files, gold) without calling anything; and
 - `b.describe(plan)`: says in words what a plan will do, before you pay for it.
 
+### Config
+
+A run can also be one YAML file, every key written out, so the file says the whole run (`config`):
+
+```yaml
+dataset: my-dataset            # a folder or an hf:// address
+manifest: manifest.parquet
+scorers: {exact: {}}           # what grades it, by the names the package gives them, each with its options
+rows: {sample: 0, limit: 0, only: null}
+timeout: 1800.0
+workers: 0
+system: {copy: {upper: true}}  # the one system, by the name the package gives it, and its options
+```
+
+```python
+c = config.load("copy.yaml", ["rows.sample=5"])          # --set path=value changes one value the file has
+b = config.benchmark(c, Copying(), {"exact": Exact})     # the package names its scorers
+s = config.system(c, make)                               # and builds its systems: make(name, options)
+p = config.plan(c, b, s, "runs")
+config.write(c, s, p.run.folder)                          # the run keeps its config.yaml, every option resolved
+```
+
+A config is checked for its shape when it loads: every key given, of its kind, and nothing else. Its scorers and
+system are checked by their own classes when they are built. A package adds a key of its own by subclassing
+`config.Config`.
+
 ## The rules
 
 Three rules decide every case. They live in the parts you don't write, so a new adapter or scorer can't break
