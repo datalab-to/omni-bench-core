@@ -103,7 +103,7 @@ class Run:
         said = self.settings()
         for key in ("dataset", "manifest", "task"):
             if (was := said.get(key)) and was != question[key]:
-                raise ValueError(f"{self.folder} answers {key} {_spelled(was)}, not {_spelled(question[key])}: "
+                raise ValueError(f"{self.folder} answers {key} {was}, not {question[key]}: "
                                  f"grade it with the {key} it was run on")
 
     def prepare(self, question: Mapping[str, Any], dataset_commit: str | None, timeout: float,
@@ -225,14 +225,6 @@ class Run:
         """Each row's recorded cost, one record at a time; rows with none are left out."""
         for i in ids:
             if c := (self.record(i) or {}).get("cost"): yield c
-
-
-def _spelled(x: Any) -> str:
-    """A dataset, manifest or task as a message writes it: a task as its name and options, `parse (outputs=html)`."""
-    if not isinstance(x, dict): return str(x)
-    opts = ", ".join(f"{k}={' '.join(map(str, v)) if isinstance(v, list) else v}"
-                     for k, v in x.get("options", {}).items())
-    return f"{x.get('name')}" + (f" ({opts})" if opts else "")
 
 
 def identity(system: adapter.Adapter, question: Mapping[str, Any]) -> dict[str, Any]:
