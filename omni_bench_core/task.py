@@ -7,7 +7,7 @@ import dataclasses
 from pathlib import Path
 from typing import Any, ClassVar
 
-from omni_bench_core import data, errors
+from omni_bench_core import data
 
 
 @dataclasses.dataclass(frozen=True)
@@ -20,8 +20,9 @@ class Task[R: data.Row, I](abc.ABC):
             def input(self, row: Doc) -> Question: ...                               # what a system is sent
 
     A new task is needed only when the input or the output changes; a new way to grade is a scorer, and a new
-    system is an adapter. `name` defaults to the class's name in lower case. The fields are options, and part
-    of a run's question, so `Segment("base")` and `Segment("hard")` never share a folder.
+    system is an adapter. `name` defaults to the class's name in lower case, and is the task in a run's question.
+    A task has no options (no fields): what varies between runs of one task is the dataset, the manifest, the
+    scorers or the system, each of which a run already names.
     """
 
     name: ClassVar[str] = "task"
@@ -35,18 +36,6 @@ class Task[R: data.Row, I](abc.ABC):
     def input(self, row: R) -> I:
         """What a system is sent for `row`: the only part of the row an adapter sees, so the gold never reaches a
         system. Raise `FileNotFoundError` when the row's input file is missing."""
-
-    def options(self) -> dict[str, Any]:
-        """The task's options, as a run's settings.json records them."""
-        errors.check_dataclass(type(self), Task)
-        out = dataclasses.asdict(self)
-        errors.plain(out, f"{type(self).__name__}'s options")
-        return out
-
-    def identity(self) -> dict[str, Any]:
-        """The task's name and options as JSON reads them back (a tuple becomes a list), so it compares equal to
-        what a run's settings.json holds."""
-        return {"name": self.name, "options": self.options()}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

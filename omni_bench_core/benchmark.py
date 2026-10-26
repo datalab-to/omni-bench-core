@@ -80,6 +80,9 @@ class Benchmark:
         if self.dataset_name is not None and not (isinstance(self.dataset_name, str) and self.dataset_name.strip()):
             raise ValueError(f"dataset_name is {self.dataset_name!r}; give the dataset's name, a non-empty string")
         errors.check_dataclass(type(self.task), task.Task)
+        if fields := [f.name for f in dataclasses.fields(self.task)]:
+            raise TypeError(f"{type(self.task).__name__} has fields {', '.join(fields)}, but a task has no options: "
+                            "what varies between runs is the dataset, the manifest, a scorer or the system")
         for s in self.scorers:
             errors.check_dataclass(type(s), scorer.Scorer)
             # Note: `score` can't be abstract, since a scorer that scores rows together writes `score_all` instead;
@@ -100,7 +103,7 @@ class Benchmark:
     def question(self, selection: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """What a run answers besides its system: the dataset, manifest, task and choice of rows."""
         return {"dataset": self.dataset_name or data.dataset_id(self.dataset),
-                "manifest": data.manifest_path(self.manifest), "task": self.task.identity(),
+                "manifest": data.manifest_path(self.manifest), "task": self.task.name,
                 "rows": dict(selection or {})}
 
     def plan(self, system: adapter.Adapter, out: str | Path, *, limit: int = 0, sample: int = 0,

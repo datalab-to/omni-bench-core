@@ -120,6 +120,9 @@ class Copying(task.Task):
 
 You write a task once per kind of task: omni-parse-bench has `Parse`, and omni-extract-bench has `Extract`.
 
+A task has no options (no fields), and a run's question names it by its `name`. What varies between runs of one
+task is the dataset, the manifest, the scorers or the system, which the run names already.
+
 ### Adapter
 
 An adapter is how to call one system. It is a frozen dataclass whose fields are the system's options, so one

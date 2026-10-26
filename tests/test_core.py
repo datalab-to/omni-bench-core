@@ -588,18 +588,23 @@ def test_reading_marks_the_systems_fault(tmp: Path) -> None:
         pass
 
 
-@dataclasses.dataclass(frozen=True)
 class CopyingTwice(Copying):
-    twice: bool = True
+    pass
 
 
-def test_another_task_is_another_folder(tmp: Path) -> None:
+@dataclasses.dataclass(frozen=True)
+class CopyingSome(Copying):
+    some: bool = True
+
+
+def test_another_task_is_another_folder_and_a_task_has_no_options(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"))
     other = benchmark.Benchmark(CopyingTwice(), tmp / "d", [Exact()])
+    refused(benchmark.Benchmark, CopyingSome(), tmp / "d", [Exact()], match="CopyingSome has fields some")
     assert runs.identity(GoldEcho(), b.question()) != runs.identity(GoldEcho(), other.question())
     name = b.run(GoldEcho(), tmp / "runs")["run"]
     refused(other.grade, tmp / "runs" / name, match="answers task")
-    assert json.loads((tmp / "runs" / name / "settings.json").read_text())["task"] == {"name": "copying", "options": {}}
+    assert json.loads((tmp / "runs" / name / "settings.json").read_text())["task"] == "copying"
 
 
 def test_failures_can_be_audited(tmp: Path) -> None:
