@@ -481,6 +481,32 @@ def test_summary_counts_are_grades(tmp: Path) -> None:
 
 
 @dataclasses.dataclass(frozen=True)
+class Chars(Exact):
+    """The share of gold characters matched, pooled over rows, so a long row weighs more than a short one."""
+
+    def score(self, pred: str, gold: str) -> scorer.Score:
+        return scorer.Score({"right": sum(a == b for a, b in zip(pred, gold)), "chars": len(gold)})
+
+    def zero(self, row: Doc, gold: str) -> scorer.Score:
+        return scorer.Score({"right": 0, "chars": len(gold)}, [{"missed": gold}])
+
+    def summarize(self, lines):
+        return {"headline": sum(x["right"] for x in lines) / sum(x["chars"] for x in lines), "headline_is": "chars"}
+
+
+def test_zero_scores_a_failed_row_in_the_scorers_own_units(tmp: Path) -> None:
+    b = bench(dataset(tmp / "d"), Chars(), Exact())
+    g = b.run(Copy(), tmp / "runs")
+    s = g["scorers"]["chars"]
+    # c1's 9 characters count as missed, so 16/25, where coverage alone would give 4/5
+    assert s["failed"] == 1 and s["zeroed"] == 1 and s["coverage"] == 1.0 and abs(s["headline"] - 16 / 25) < 1e-9, s
+    assert g["scorers"]["exact"]["zeroed"] == 0 and abs(g["scorers"]["exact"]["headline"] - 0.8) < 1e-9
+    lines = {x["id"]: x for x in map(json.loads, (tmp / "runs" / g["run"] / "chars" / "scores.jsonl").open())}
+    assert lines["c1"]["status"] == "failed" and lines["c1"]["chars"] == 9 and "refused" in lines["c1"]["error"]
+    assert json.loads((tmp / "runs" / g["run"] / "chars" / "details" / "c1.jsonl").read_text()) == {"missed": "refuse me"}
+
+
+@dataclasses.dataclass(frozen=True)
 class ExactInTwos(Exact):
     batch_size: ClassVar[int | None] = 2
 

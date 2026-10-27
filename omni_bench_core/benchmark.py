@@ -304,7 +304,7 @@ def _headline(s: dict[str, Any]) -> str:
     if s["scored"] is None: return f"{s['headline']:.4f}: none of the {s['rows']} rows was scored"
     sc = s["scored"]
     return (f"{s['headline']:.4f} = {sc['headline']:.4f} ({sc['headline_is']}) × coverage "
-            f"{s['rows'] - s['failed']}/{s['rows']}")
+            f"{s['rows'] - s['failed'] + s['zeroed']}/{s['rows']}")
 
 
 def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: float) -> dict[str, Any]:

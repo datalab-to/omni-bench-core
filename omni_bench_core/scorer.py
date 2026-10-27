@@ -46,11 +46,13 @@ class Score(NamedTuple):
 
 
 class _Failed(NamedTuple):
-    """A row with no usable prediction, which counts 0. Only `grade` makes one: from the row's record, a missing
-    prediction, or `prediction` raising `SystemFailed` (with its `traceback`)."""
+    """A row with no usable prediction, which counts 0, as the scorer's `zero` scores it if it gives one. Only
+    `grade` makes one: from the row's record, a missing prediction, or `prediction` raising `SystemFailed` (with
+    its `traceback`)."""
 
     error: str
     traceback: str | None = None
+    zero: Score | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,6 +76,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         name            the scorer's name; the class's name in snake case
         prediction      what the scorer reads of a prediction; the prediction itself
         row_fields      what of the row each line carries under "row"; nothing
+        zero            the score a failed row counts as; None, which leaves failed rows to coverage
         check_gold      refuses a dataset before any call; reads every gold
         score_all       many rows' scores at once; `score` for each row
         workers         rows scored at once; 1
@@ -93,8 +96,9 @@ class Scorer[R: data.Row, G, P](abc.ABC):
           gold(row), prediction(output)     each row's gold and prediction, read once
           score_all(rows, preds, golds)     `batch_size` rows at a time, without kept scores
             score(pred, gold)               one row
+          zero(row, gold)                   a failed row's score, if the scorer gives one
           row_fields(row)                   each line's "row"
-          summarize(lines)                  the scored rows' lines as one summary
+          summarize(lines)                  the scored (and zeroed) rows' lines as one summary
     """
 
     name: ClassVar[str]
@@ -152,11 +156,18 @@ class Scorer[R: data.Row, G, P](abc.ABC):
     @abc.abstractmethod
     def summarize(self, lines: Sequence[Line]) -> Summary:
         """The scored rows' lines as one summary. Each line is `{"id", "row" (if any), ...the result's values}`;
-        failed rows are never given, and it isn't called when no row was scored.
+        a failed row is given only with the score `zero` gave it, and it isn't called when no row has a score.
 
         Return `headline`, a number from 0 to 1 where higher is better, and `headline_is`, what it is
         ("accuracy"); anything else is the scorer's own. `grade` keeps it under the summary's `scored` and
         multiplies the headline by coverage."""
+
+    def zero(self, row: R, gold: G) -> Score | None:
+        """The score a failed row counts as, in the scorer's own units (every test failed), given to `summarize`
+        with the scored rows' lines. None, the default, leaves failed rows out, and the headline's coverage counts
+        each as 0: the same thing when the headline is a mean over rows, but not when rows weigh differently (a
+        page with 40 tests and a page with 2)."""
+        return None
 
     def check_gold(self, rows: Sequence[R]) -> None:
         """Refuses, before any call, a dataset whose gold this scorer can't read. Reads every gold by default."""
@@ -192,8 +203,8 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         3. for each batch of `batch_size` rows: fails the rows the core knows failed, reuses kept scores,
            scores the rest (`score_all`), and writes their details;
         4. refuses unscored rows, unless `partial`, which counts them failed;
-        5. summarizes the scored lines (`summarize`), checks the summary, and multiplies its headline by
-           coverage; and
+        5. summarizes the scored lines and the failed rows `zero` scores (`summarize`), checks the summary, and
+           multiplies its headline by coverage, the share of rows summarized; and
         6. writes scores.jsonl and summary.json, only when grading finishes.
 
         `write=False` writes no results, though it may still rebuild a prediction or fill the cache."""
@@ -211,6 +222,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         home = run.folder / self.folder_name
         code = self._code() if self.cache else ""
         lines: list[Line] = []
+        zeroed: set[str] = set()
         _discard(home)
         try:
             # Note: one batch's predictions, golds and details in memory at a time.
@@ -225,6 +237,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
                     fresh = {i: self._as_json(x) for i, x in fresh.items()}
                     _keep(home, keys, fresh)
                 scores = failed | kept | fresh
+                zeroed |= {i for i, x in failed.items() if x.zero is not None}
                 lines += [self._line(r, scores[r.id]) for r in chunk]
                 if write and details: _write_details(home, [(r.id, scores[r.id]) for r in chunk])
         except BaseException:
@@ -237,8 +250,10 @@ class Scorer[R: data.Row, G, P](abc.ABC):
                                                     if x["status"] == "unscored"], brought))
         lines = [{**x, "status": "failed", "error": f"not scored: {x['error']}"} if x["status"] == "unscored" else x
                  for x in lines]
-        ys = [{k: v for k, v in x.items() if k != "status"} for x in lines if x["status"] == "scored"]
-        summary = self._framed(self.summarize(ys) if ys else None, lines, run.name)
+        core = {"scored": ("status",), "failed": ("status", "error", "traceback")}
+        ys = [{k: v for k, v in x.items() if k not in core[x["status"]]} for x in lines
+              if x["status"] == "scored" or x["id"] in zeroed]
+        summary = self._framed(self.summarize(ys) if ys else None, lines, len(zeroed), run.name)
         # Note: counts and a few ids, not every id, which a run stopped early would have thousands of.
         if missing or unscored:
             summary["partial"] = {"no_answer": len(missing), "not_scored": len(unscored),
@@ -254,26 +269,36 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         ready: list[tuple[R, P, G]] = []
         for r in rows:
             if err := (run.record(r.id) or {}).get("error"):
-                failed[r.id] = _Failed(f"{err['type']}: {err['message']}")
+                failed[r.id] = self._failed(r, f"{err['type']}: {err['message']}")
                 continue
             try:
                 output = run.prediction(r.id)
             except FileNotFoundError:
-                failed[r.id] = _Failed(f"no prediction: predictions/{r.id}.json")
+                failed[r.id] = self._failed(r, f"no prediction: predictions/{r.id}.json")
                 continue
             except ValueError as exc:   # Note: the core's own check that the file is JSON
-                failed[r.id] = _Failed(str(exc))
+                failed[r.id] = self._failed(r, str(exc))
                 continue
             try:
                 pred = self.prediction(output)
             except errors.SystemFailed as exc:
-                failed[r.id] = _Failed(str(exc), "".join(traceback.format_exception(exc)))
+                failed[r.id] = self._failed(r, str(exc), "".join(traceback.format_exception(exc)))
                 continue
             except Exception as exc:
                 errors.noted(exc, type(self), f"reading the prediction of {r.id}")
                 raise
             ready.append((r, pred, self._gold(r)))
         return failed, ready
+
+    def _failed(self, r: R, error: str, tb: str | None = None) -> _Failed:
+        """A failed row, with the score `zero` gives it; its gold is read only for a scorer that gives one."""
+        if type(self).zero is Scorer.zero: return _Failed(error, tb)
+        z = self.zero(r, self._gold(r))
+        if not (z is None or isinstance(z, Score)):
+            raise TypeError(f"{type(self).__name__}.zero must return a scorer.Score or None; for row {r.id} it "
+                            f"returned a {type(z).__name__}")
+        if z is not None: _check_score(type(self).__name__, r.id, z)
+        return _Failed(error, tb, z)
 
     def _scored(self, ready: Sequence[tuple[R, P, G]]) -> dict[str, Score | errors.Unscored]:
         """`score_all` of the rows ready to score, by id, checked."""
@@ -320,27 +345,34 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         errors.plain(f, f"{self.name}.row_fields for row {r.id}")
         match x:
             case Score():
-                if clash := sorted(set(x.result) & {"id", "status", "row"}):
-                    raise ValueError(f"{self.name}'s result for row {r.id} holds {clash}, which its line keeps for "
-                                     "the core; name them otherwise")
-                return {"id": r.id, "status": "scored", **row, **x.result}
+                return {"id": r.id, "status": "scored", **row, **self._result(r, x, ())}
             case errors.Unscored():
                 return {"id": r.id, "status": "unscored", **row, "error": errors.capped(str(x))}
             case _Failed():
-                return {"id": r.id, "status": "failed", **row, "error": errors.capped(x.error),
+                zero = self._result(r, x.zero, ("error", "traceback")) if x.zero is not None else {}
+                return {"id": r.id, "status": "failed", **row, **zero, "error": errors.capped(x.error),
                         **({"traceback": errors.capped(x.traceback)} if x.traceback else {})}
             case _:
                 raise AssertionError(x)
 
-    def _framed(self, summary: Summary | None, lines: Sequence[Line], run: str) -> Summary:
+    def _result(self, r: R, x: Score, kept: tuple[str, ...]) -> dict[str, Any]:
+        """A score's values for the row's line, refused if they use a key the line keeps for the core (`id`,
+        `status`, `row`, and `kept`)."""
+        if clash := sorted(set(x.result) & {"id", "status", "row", *kept}):
+            raise ValueError(f"{self.name}'s result for row {r.id} holds {clash}, which its line keeps for the core; "
+                             "name them otherwise")
+        return x.result
+
+    def _framed(self, summary: Summary | None, lines: Sequence[Line], zeroed: int, run: str) -> Summary:
         """The grading's summary: the core's fields, and `summarize`'s summary under `scored`. The headline is
-        `scored`'s times coverage, or 0 when no row was scored (`scored` is None)."""
-        cover = coverage(lines)
+        `scored`'s times coverage, or 0 when no row has a score (`scored` is None)."""
+        cover = coverage(lines, zeroed)
         if summary is not None: _check_summary(type(self).__name__, summary)
         return {"scorer": self.name, "options": self.options(), "run": run,
                 "headline": 0.0 if summary is None else summary["headline"] * cover,
                 "headline_is": "scored.headline × coverage", "rows": len(lines),
-                "failed": sum(x["status"] == "failed" for x in lines), "coverage": cover, "scored": summary}
+                "failed": sum(x["status"] == "failed" for x in lines), "zeroed": zeroed, "coverage": cover,
+                "scored": summary}
 
     def _code(self) -> str:
         """A digest of the code the scorer and its judges run: their classes' names and every Python file of
@@ -415,8 +447,10 @@ def _keep(home: Path, keys: dict[str, str], scores: dict[str, Score | errors.Uns
 
 
 def _write_details(home: Path, scores: Sequence[tuple[str, Any]]) -> None:
-    """Writes each scored row's details to `<home>/.details.partial/`, which `_write` moves into place."""
+    """Writes each scored (or zeroed) row's details to `<home>/.details.partial/`, which `_write` moves into
+    place."""
     for i, x in scores:
+        if isinstance(x, _Failed): x = x.zero
         if not isinstance(x, Score) or x.details is None: continue
         (home / ".details.partial").mkdir(parents=True, exist_ok=True)
         runs.write_lines(home / ".details.partial" / f"{i}.jsonl", x.details)
@@ -481,10 +515,11 @@ def ask[I](judge: adapter.Adapter[I], x: I, *, timeout: float = 300.0) -> dict[s
     return rec
 
 
-def coverage(lines: Sequence[Line]) -> float:
-    """The share of rows scored rather than failed; unscored rows count as neither."""
+def coverage(lines: Sequence[Line], zeroed: int = 0) -> float:
+    """The share of rows `summarize` was given: scored, or failed and `zeroed` by the scorer; unscored rows count
+    as neither."""
     n = sum(x["status"] in ("scored", "failed") for x in lines)
-    return sum(x["status"] == "scored" for x in lines) / n if n else 0.0
+    return (sum(x["status"] == "scored" for x in lines) + zeroed) / n if n else 0.0
 
 
 def _check_summary(name: str, s: Any) -> None:
