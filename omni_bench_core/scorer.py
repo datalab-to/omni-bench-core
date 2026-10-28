@@ -76,6 +76,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         name            the scorer's name; the class's name in snake case
         prediction      what the scorer reads of a prediction; the prediction itself
         row_fields      what of the row each line carries under "row"; nothing
+        detail_fields   what of the row each of its detail lines carries; nothing
         zero            the score a failed row counts as; None, which leaves failed rows to coverage
         check_gold      refuses a dataset before any call; reads every gold
         score_all       many rows' scores at once; `score` for each row
@@ -98,6 +99,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
             score(pred, gold)               one row
           zero(row, gold)                   a failed row's score, if the scorer gives one
           row_fields(row)                   each line's "row"
+          detail_fields(row)                each detail line's fields from the row
           summarize(lines)                  the scored (and zeroed) rows' lines as one summary
     """
 
@@ -148,6 +150,12 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         waits for the next grading. Not abstract, since `score_all` can replace it; a scorer with neither is
         refused."""
         raise NotImplementedError(f"{type(self).__name__} has no score(pred, gold)")
+
+    def detail_fields(self, row: R) -> dict[str, Any]:
+        """What of the row each of its detail lines carries (a page, a document), so the details can be sliced
+        after grading without the dataset; nothing by default. A detail line that holds one of these keys is
+        refused."""
+        return {}
 
     def row_fields(self, row: R) -> dict[str, Any]:
         """What of the row its line carries under `"row"`: fields `summarize` groups by (a document, a language)."""
@@ -239,7 +247,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
                 scores = failed | kept | fresh
                 zeroed |= {i for i, x in failed.items() if x.zero is not None}
                 lines += [self._line(r, scores[r.id]) for r in chunk]
-                if write and details: _write_details(home, [(r.id, scores[r.id]) for r in chunk])
+                if write and details: _write_details(home, [(r.id, self._details(r, scores[r.id])) for r in chunk])
         except BaseException:
             _discard(home)
             raise
@@ -355,6 +363,17 @@ class Scorer[R: data.Row, G, P](abc.ABC):
             case _:
                 raise AssertionError(x)
 
+    def _details(self, r: R, x: Score | errors.Unscored | _Failed) -> list[dict[str, Any]] | None:
+        """A row's detail lines, a scored row's or a failed row's from `zero`, each with the row's `detail_fields`."""
+        if isinstance(x, _Failed): x = x.zero
+        if not isinstance(x, Score) or x.details is None: return None
+        if not (f := self.detail_fields(r)): return x.details
+        errors.plain(f, f"{self.name}.detail_fields for row {r.id}")
+        if clash := sorted({k for d in x.details for k in d} & set(f)):
+            raise ValueError(f"{self.name}'s details for row {r.id} hold {clash}, which its detail_fields add; name "
+                             "them otherwise")
+        return [f | d for d in x.details]
+
     def _result(self, r: R, x: Score, kept: tuple[str, ...]) -> dict[str, Any]:
         """A score's values for the row's line, refused if they use a key the line keeps for the core (`id`,
         `status`, `row`, and `kept`)."""
@@ -446,14 +465,13 @@ def _keep(home: Path, keys: dict[str, str], scores: dict[str, Score | errors.Uns
         runs.write_json(home / "cache" / f"{i}.json", {"key": keys[i], "result": x.result, "details": x.details})
 
 
-def _write_details(home: Path, scores: Sequence[tuple[str, Any]]) -> None:
-    """Writes each scored (or zeroed) row's details to `<home>/.details.partial/`, which `_write` moves into
+def _write_details(home: Path, details: Sequence[tuple[str, list[dict[str, Any]] | None]]) -> None:
+    """Writes each row's detail lines, if it has any, to `<home>/.details.partial/`, which `_write` moves into
     place."""
-    for i, x in scores:
-        if isinstance(x, _Failed): x = x.zero
-        if not isinstance(x, Score) or x.details is None: continue
+    for i, ds in details:
+        if ds is None: continue
         (home / ".details.partial").mkdir(parents=True, exist_ok=True)
-        runs.write_lines(home / ".details.partial" / f"{i}.jsonl", x.details)
+        runs.write_lines(home / ".details.partial" / f"{i}.jsonl", ds)
 
 
 def _write(home: Path, lines: Sequence[Line], summary: Summary) -> None:

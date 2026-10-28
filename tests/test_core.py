@@ -490,6 +490,9 @@ class Chars(Exact):
     def zero(self, row: Doc, gold: str) -> scorer.Score:
         return scorer.Score({"right": 0, "chars": len(gold)}, [{"missed": gold}])
 
+    def detail_fields(self, row: Doc) -> dict[str, Any]:
+        return {"lang": row.extra["lang"]}
+
     def summarize(self, lines):
         return {"headline": sum(x["right"] for x in lines) / sum(x["chars"] for x in lines), "headline_is": "chars"}
 
@@ -503,7 +506,20 @@ def test_zero_scores_a_failed_row_in_the_scorers_own_units(tmp: Path) -> None:
     assert g["scorers"]["exact"]["zeroed"] == 0 and abs(g["scorers"]["exact"]["headline"] - 0.8) < 1e-9
     lines = {x["id"]: x for x in map(json.loads, (tmp / "runs" / g["run"] / "chars" / "scores.jsonl").open())}
     assert lines["c1"]["status"] == "failed" and lines["c1"]["chars"] == 9 and "refused" in lines["c1"]["error"]
-    assert json.loads((tmp / "runs" / g["run"] / "chars" / "details" / "c1.jsonl").read_text()) == {"missed": "refuse me"}
+    c1 = json.loads((tmp / "runs" / g["run"] / "chars" / "details" / "c1.jsonl").read_text())
+    assert c1 == {"lang": "en", "missed": "refuse me"}, c1                 # detail_fields, on a zeroed row too
+    assert "lang" not in lines["c1"], lines["c1"]                           # and only on details
+
+
+@dataclasses.dataclass(frozen=True)
+class Clashes(Chars):
+    def detail_fields(self, row: Doc) -> dict[str, Any]:
+        return {"missed": 1}
+
+
+def test_a_detail_field_that_a_detail_line_holds_is_refused(tmp: Path) -> None:
+    b = bench(dataset(tmp / "d"), Clashes())
+    refused(b.run, Copy(), tmp / "runs", match="hold ['missed'], which its detail_fields add")
 
 
 @dataclasses.dataclass(frozen=True)

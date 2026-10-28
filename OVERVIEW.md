@@ -456,6 +456,7 @@ Each is optional, and described in its class's docstring.
 | you want | do this |
 | --- | --- |
 | a summary broken down by something the row holds (a language, a source) | return it from `Scorer.row_fields`, and group the lines by `line["row"][<field>]` in `summarize` |
+| details you can slice after grading by something the row holds (a page, a document) | return it from `Scorer.detail_fields`; each of the row's detail lines carries it |
 | a slow scorer, an LLM as a judge, or scoring on your own machines | see "How scoring runs" above |
 | to call a system with more or fewer rows at once | `workers=` on `run`; 0 means the adapter's own `workers` |
 | to run several systems at once, sharing one rate limit | run each in its own thread or process; to share a limit, give each run an `executor` factory that returns one shared pool |
