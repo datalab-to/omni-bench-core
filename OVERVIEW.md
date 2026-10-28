@@ -271,7 +271,7 @@ Grading turns each row into one line of `scores.jsonl`, and all the lines into o
                                                          summarize
                                                              v
            {"headline": 0.333, "headline_is": "scored.headline × coverage",
-            "rows": 3, "failed": 1, "coverage": 0.667,
+            "rows": 3, "failed": 1, "zeroed": 0, "coverage": 0.667,
             "scored": {"headline": 0.5, "headline_is": "exact", "exact": 0.5}}
 ```
 
@@ -284,10 +284,18 @@ The status comes from types, not from the scorer. A scorer returns a `Score`, or
 timed out or was down); for anything asking again won't change, it would keep the run from ever finishing. Only
 the core fails a row: from its record, a missing prediction, or `prediction` raising `SystemFailed`.
 
-`summarize` is the handoff. It gets only the scored rows' lines, without their status, and returns `headline`,
+`summarize` is the handoff. It gets the scored rows' lines, without their status, and returns `headline`,
 a number from 0 to 1 where higher is better, and `headline_is`, what it is; anything else is the scorer's. The
-core keeps it under `scored` and adds `rows`, `failed`, `coverage`, and the top `headline`, `scored`'s times
-coverage, so a failed row counts as 0. When no row was scored, `summarize` isn't called and the headline is 0.
+core keeps it under `scored` and adds `rows`, `failed`, `zeroed`, `coverage`, and the top `headline`,
+`scored`'s times coverage, so a failed row counts as 0. When no row was scored, `summarize` isn't called and
+the headline is 0.
+
+Coverage counts every failed row as one row's worth of 0. That is right when the headline is a mean over rows,
+and wrong when rows weigh differently: a page with 40 tests that fails should cost 40 tests, not one page. A
+scorer whose rows weigh differently writes `zero(row, gold)`, the score a failed row counts as in its own units
+(every test failed). `summarize` then also gets each failed row's line with that score, `zeroed` counts them,
+and coverage is the share of rows `summarize` was given, so only unscored rows left in a partial grading lower
+it. A scorer without `zero` is graded as before.
 A headline outside 0 to 1 is refused. `Scorer.grade`, which does all this, can't be overridden.
 
 ### How scoring runs
@@ -448,6 +456,7 @@ Each is optional, and described in its class's docstring.
 | you want | do this |
 | --- | --- |
 | a summary broken down by something the row holds (a language, a source) | return it from `Scorer.row_fields`, and group the lines by `line["row"][<field>]` in `summarize` |
+| details you can slice after grading by something the row holds (a page, a document) | return it from `Scorer.detail_fields`; each of the row's detail lines carries it |
 | a slow scorer, an LLM as a judge, or scoring on your own machines | see "How scoring runs" above |
 | to call a system with more or fewer rows at once | `workers=` on `run`; 0 means the adapter's own `workers` |
 | to run several systems at once, sharing one rate limit | run each in its own thread or process; to share a limit, give each run an `executor` factory that returns one shared pool |
