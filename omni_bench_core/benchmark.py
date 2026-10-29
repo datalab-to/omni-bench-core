@@ -52,7 +52,7 @@ class Benchmark:
        same question;
     2. grading reports only a finished run (every row answered or failed, and scored); otherwise it refuses
        and names the rows, and `partial=True` counts them 0; and
-    3. a row fails only when code raises `SystemFailed`, and the scorer's `zero` scores it. Any other exception stops the run and is raised as
+    3. a row fails only when code raises `SystemFailed`, and the scorer's `score_failure` scores it. Any other exception stops the run and is raised as
        it is; the answers already paid for are kept.
 
     Methods:

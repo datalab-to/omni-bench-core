@@ -52,13 +52,13 @@ class Score(NamedTuple):
 
 
 class _Failed(NamedTuple):
-    """A row with no usable prediction, scored by the scorer's `zero`. Only `grade` makes one: from the row's
+    """A row with no usable prediction, scored by the scorer's `score_failure`. Only `grade` makes one: from the row's
     record, a missing prediction, `prediction` raising `SystemFailed` (with its `traceback`), or a partial
     grading's unscored row. `cause` is one of `CAUSES`."""
 
     cause: str
     error: str
-    zero: Score
+    score: Score
     traceback: str | None = None
 
 
@@ -74,13 +74,13 @@ class Scorer[R: data.Row, G, P](abc.ABC):
             def score(self, pred, gold):          # one row's numbers
                 return scorer.Score({"exact": pred["text"] == gold})
 
-            def zero(self, gold):                 # a failed row, as the worst score
+            def score_failure(self, gold):        # a failed row, as the worst score
                 return scorer.Score({"exact": False})
 
             def summarize(self, lines):           # every row's line as one summary
                 return {"headline": sum(x["exact"] for x in lines) / len(lines), "headline_is": "exact"}
 
-    `gold`, `zero` and `summarize` are abstract; `score` is required unless `score_all` is written instead.
+    `gold`, `score_failure` and `summarize` are abstract; `score` is required unless `score_all` is written instead.
     Optional, with defaults:
 
         name            the scorer's name; the class's name in snake case
@@ -106,10 +106,10 @@ class Scorer[R: data.Row, G, P](abc.ABC):
           gold(row), prediction(output)     each row's gold and prediction, read once
           score_all(rows, preds, golds)     `batch_size` rows at a time, without kept scores
             score(pred, gold)               one row
-          zero(gold)                        a failed row's score
+          score_failure(gold)               a failed row's score
           row_fields(row)                   each line's "row"
           detail_fields(row)                each detail line's fields from the row
-          summarize(lines)                  every row's line, scored or zeroed, as one summary
+          summarize(lines)                  every row's line, scored or failed, as one summary
     """
 
     name: ClassVar[str]
@@ -124,8 +124,8 @@ class Scorer[R: data.Row, G, P](abc.ABC):
             cls.name = re.sub(r"(?<!^)(?=[A-Z])", "_", cls.__name__).lower()
         if "grade" in cls.__dict__:
             raise TypeError(f"{cls.__name__} overrides grade, which holds the rules every scorer follows (finished, "
-                            "failed, the cache); override score_all to change how rows are scored, zero to change "
-                            "what a failed row counts as, or summarize to change the summary")
+                            "failed, the cache); override score_all to change how rows are scored, score_failure "
+                            "to change what a failed row counts as, or summarize to change the summary")
 
     @property
     def folder_name(self) -> str:
@@ -171,7 +171,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         return {}
 
     @abc.abstractmethod
-    def zero(self, gold: G) -> Score:
+    def score_failure(self, gold: G) -> Score:
         """A failed row's score: the worst score the row can get, in the scorer's own units (every test failed,
         every gold character missed). `summarize` gets it as it gets a scored row's, so every number the summary
         holds counts the failure, weighed as the scorer weighs rows. Not `score` of an empty answer, which can
@@ -179,7 +179,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
 
     @abc.abstractmethod
     def summarize(self, lines: Sequence[Line]) -> Summary:
-        """Every row's line as one summary, a failed row's with the score `zero` gave it. Each line is `{"id",
+        """Every row's line as one summary, a failed row's with the score `score_failure` gave it. Each line is `{"id",
         "row" (if any), ...the result's values}`, without its status: a summary is the same whether a row failed
         or answered as badly as possible.
 
@@ -217,8 +217,8 @@ class Scorer[R: data.Row, G, P](abc.ABC):
 
         1. refuses a folder of your own that names none of the rows, and rebuilds lost predictions from records;
         2. refuses rows with neither an answer nor a recorded failure, unless `partial`;
-        3. for each batch of `batch_size` rows: fails the rows the core knows failed (`zero`), reuses kept scores,
-           scores the rest (`score_all`), and writes their details;
+        3. for each batch of `batch_size` rows: fails the rows the core knows failed (`score_failure`), reuses kept
+           scores, scores the rest (`score_all`), and writes their details;
         4. refuses unscored rows, unless `partial`, which fails them;
         5. summarizes every row's line (`summarize`), checks the summary, and adds the core's fields: `rows`,
            `failed` by cause (`CAUSES`), and `coverage`, the share of rows scored; and
@@ -305,12 +305,12 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         return failed, ready
 
     def _failed(self, r: R, cause: str, error: str, tb: str | None = None) -> _Failed:
-        """A failed row, with the score `zero` gives it."""
+        """A failed row, with the score `score_failure` gives it."""
         assert cause in CAUSES, cause
-        z = self.zero(self._gold(r))
+        z = self.score_failure(self._gold(r))
         if not isinstance(z, Score):
-            raise TypeError(f"{type(self).__name__}.zero must return a scorer.Score; for row {r.id} it returned a "
-                            f"{type(z).__name__}")
+            raise TypeError(f"{type(self).__name__}.score_failure must return a scorer.Score; for row {r.id} it "
+                            f"returned a {type(z).__name__}")
         _check_score(type(self).__name__, r.id, z)
         return _Failed(cause, error, z, tb)
 
@@ -364,14 +364,15 @@ class Scorer[R: data.Row, G, P](abc.ABC):
                 return {"id": r.id, "status": "unscored", **row, "error": errors.capped(str(x))}
             case _Failed():
                 return {"id": r.id, "status": "failed", "cause": x.cause, **row,
-                        **self._result(r, x.zero, ("cause", "error", "traceback")), "error": errors.capped(x.error),
+                        **self._result(r, x.score, ("cause", "error", "traceback")), "error": errors.capped(x.error),
                         **({"traceback": errors.capped(x.traceback)} if x.traceback else {})}
             case _:
                 raise AssertionError(x)
 
     def _details(self, r: R, x: Score | errors.Unscored | _Failed) -> list[dict[str, Any]] | None:
-        """A row's detail lines, a scored row's or a failed row's from `zero`, each with the row's `detail_fields`."""
-        if isinstance(x, _Failed): x = x.zero
+        """A row's detail lines, a scored row's or a failed row's from `score_failure`, each with the row's
+        `detail_fields`."""
+        if isinstance(x, _Failed): x = x.score
         if not isinstance(x, Score) or x.details is None: return None
         if not (f := self.detail_fields(r)): return x.details
         errors.plain(f, f"{self.name}.detail_fields for row {r.id}")
@@ -557,7 +558,7 @@ def ask[I](judge: adapter.Adapter[I], x: I, *, timeout: float = 300.0) -> dict[s
 
 
 def coverage(lines: Sequence[Line]) -> float:
-    """The share of rows scored: the rest failed, and counted as `zero` scored them."""
+    """The share of rows scored: the rest failed, and counted as `score_failure` scored them."""
     return sum(x["status"] == "scored" for x in lines) / len(lines)
 
 

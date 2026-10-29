@@ -102,7 +102,7 @@ class Exact(scorer.Scorer):
         diffs = [{"at": i, "pred": a, "gold": b} for i, (a, b) in enumerate(zip(pred, gold)) if a != b]
         return scorer.Score({"exact": pred == gold, "length": len(pred)}, diffs or None)
 
-    def zero(self, gold: str) -> scorer.Score:
+    def score_failure(self, gold: str) -> scorer.Score:
         return scorer.Score({"exact": False, "length": 0})
 
     def summarize(self, lines):
@@ -149,7 +149,7 @@ class Agree(Exact):
         return scorer.Score({"agree": rec["output"]["verdict"] == "yes", "judge_usd": rec["cost"]["usd"]},
                             [rec["output"]])
 
-    def zero(self, gold: str) -> scorer.Score:
+    def score_failure(self, gold: str) -> scorer.Score:
         return scorer.Score({"agree": False, "judge_usd": 0.0})
 
     def summarize(self, lines):
@@ -493,7 +493,7 @@ class Chars(Exact):
     def score(self, pred: str, gold: str) -> scorer.Score:
         return scorer.Score({"right": sum(a == b for a, b in zip(pred, gold)), "chars": len(gold)})
 
-    def zero(self, gold: str) -> scorer.Score:
+    def score_failure(self, gold: str) -> scorer.Score:
         return scorer.Score({"right": 0, "chars": len(gold)}, [{"missed": gold}])
 
     def detail_fields(self, row: Doc) -> dict[str, Any]:
@@ -503,7 +503,7 @@ class Chars(Exact):
         return {"headline": sum(x["right"] for x in lines) / sum(x["chars"] for x in lines), "headline_is": "chars"}
 
 
-def test_zero_scores_a_failed_row_in_the_scorers_own_units(tmp: Path) -> None:
+def test_score_failure_scores_a_failed_row_in_the_scorers_own_units(tmp: Path) -> None:
     b = bench(dataset(tmp / "d"), Chars(), Exact())
     g = b.run(Copy(), tmp / "runs")
     s = g["scorers"]["chars"]
@@ -513,7 +513,7 @@ def test_zero_scores_a_failed_row_in_the_scorers_own_units(tmp: Path) -> None:
     lines = {x["id"]: x for x in map(json.loads, (tmp / "runs" / g["run"] / "chars" / "scores.jsonl").open())}
     assert lines["c1"]["status"] == "failed" and lines["c1"]["chars"] == 9 and "refused" in lines["c1"]["error"]
     c1 = json.loads((tmp / "runs" / g["run"] / "chars" / "details" / "c1.jsonl").read_text())
-    assert c1 == {"lang": "en", "missed": "refuse me"}, c1                 # detail_fields, on a zeroed row too
+    assert c1 == {"lang": "en", "missed": "refuse me"}, c1                 # detail_fields, on a failed row too
     assert "lang" not in lines["c1"], lines["c1"]                           # and only on details
 
 
@@ -885,7 +885,7 @@ class NoSummary(scorer.Scorer):
     def gold(self, row):
         return None
 
-    def zero(self, gold):
+    def score_failure(self, gold):
         return scorer.Score({"n": 0})
 
     def score(self, pred, gold):
@@ -893,7 +893,7 @@ class NoSummary(scorer.Scorer):
 
 
 @dataclasses.dataclass(frozen=True)
-class NoZero(scorer.Scorer):
+class NoScoreFailure(scorer.Scorer):
     def gold(self, row):
         return None
 
@@ -906,7 +906,7 @@ class NoScore(scorer.Scorer):
     def gold(self, row):
         return None
 
-    def zero(self, gold):
+    def score_failure(self, gold):
         return scorer.Score({"n": 0})
 
     def summarize(self, lines):
@@ -959,7 +959,7 @@ class Status(Exact):
 
 def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(tmp: Path) -> None:
     refused(NoSummary, match="abstract method 'summarize'")             # Python refuses it: summarize is abstract
-    refused(NoZero, match="abstract method 'zero'")                     # and zero: a failed row's score is the scorer's
+    refused(NoScoreFailure, match="abstract method 'score_failure'")    # a failed row's score is the scorer's too
     refused(bench, dataset(tmp / "d"), NoScore(), match="NoScore has neither score")
     for value, what, match in ((2.0, "exact", '"headline": 2.0'), (-0.1, "exact", '"headline": -0.1'),
                                (True, "exact", '"headline": True'), (None, "exact", '"headline": None'),
@@ -976,7 +976,7 @@ def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(
     assert s["failed"]["not_scored"] == 1 and s["partial"]["not_scored"] == 1 and s["headline"] == 0.8, s
     every = dataset(tmp / "refused", {"r1": ("", "refuse 1"), "r2": ("", "refuse 2")})
     s = bench(every).run(Copy(), tmp / "runs-none")["scorers"]["exact"]
-    assert s["headline"] == 0.0 and s["coverage"] == 0.0 and s["failed"]["system"] == 2, s   # every row zeroed
+    assert s["headline"] == 0.0 and s["coverage"] == 0.0 and s["failed"]["system"] == 2, s   # every row failed
 
 
 @dataclasses.dataclass(frozen=True)

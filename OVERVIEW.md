@@ -238,7 +238,7 @@ A scorer is one way of grading: a frozen dataclass whose fields are its options.
 
 - `gold(row)`, abstract: reads the row's gold and checks it;
 - `score(pred, gold)`: compares one prediction with its gold and returns a `Score` (or write `score_all`);
-- `zero(gold)`, abstract: a failed row's score, the worst the row can get in the scorer's units; and
+- `score_failure(gold)`, abstract: a failed row's score, the worst the row can get in the scorer's units; and
 - `summarize(lines)`, abstract: every row's line as one summary.
 
 A `Score` holds `result`, a small dict of the row's values, mostly numbers (`{"exact": True, "length": 5}`),
@@ -257,7 +257,7 @@ class Exact(scorer.Scorer):
         diffs = [{"at": i, "pred": a, "gold": b} for i, (a, b) in enumerate(zip(pred, gold)) if a != b]
         return scorer.Score({"exact": pred == gold, "length": len(pred)}, diffs or None)
 
-    def zero(self, gold: str) -> scorer.Score:                # a failed row, as the worst score
+    def score_failure(self, gold: str) -> scorer.Score:       # a failed row, as the worst score
         return scorer.Score({"exact": False, "length": 0})
 
     def summarize(self, lines: list[dict]) -> dict:           # every row's line as one summary
@@ -270,7 +270,7 @@ Grading turns each row into one line of `scores.jsonl`, and all the lines into o
 ```
   row a1:  prediction "hello", gold "hello"  --score-->  {"exact": true,  "length": 5}
   row a2:  prediction "w0rld", gold "world"  --score-->  {"exact": false, "length": 5}
-  row c1:  the call failed                   ---zero---->  {"exact": false, "length": 0}
+  row c1:  the call failed           --score_failure-->  {"exact": false, "length": 0}
                                                              |
                                                          summarize
                                                              v
@@ -289,7 +289,7 @@ the core fails a row, for one of four causes: its record says the call failed (`
 `SystemFailed` or the file isn't JSON (`unusable`), it has no prediction (`no_answer`), or a partial grading left
 it unscored (`not_scored`).
 
-A failed row still has a score: `zero(gold)`, the worst score the row can get in the scorer's own units
+A failed row still has a score: `score_failure(gold)`, the worst score the row can get in the scorer's own units
 (every test failed, every gold character missed). It isn't the score of an empty answer, which can be better
 than the worst: an empty page passes a test that a text is absent. Since only the scorer knows how it weighs
 rows (a page with 40 tests against a page with 2, a long page against a short one), only it can say what a
@@ -433,7 +433,7 @@ them:
    which rows. Every launch is a new run in its own folder; `resume` continues a run, of the same question only;
 2. grading reports only a finished run: every row answered or failed, and scored. Otherwise it refuses and
    names the rows; `partial=True` (`--partial`) counts them failed, and the summary says how many; and
-3. a row fails only when code raises `errors.SystemFailed` on purpose, and the scorer's `zero` scores it. Any other exception stops the run and
+3. a row fails only when code raises `errors.SystemFailed` on purpose, and the scorer's `score_failure` scores it. Any other exception stops the run and
    is raised as it is; every answer already paid for is kept, so resuming the run after the fix pays only for the rest.
 
 What that means, case by case:
@@ -441,8 +441,8 @@ What that means, case by case:
 | what happens | what you see | the row counts | what to do |
 | --- | --- | --- | --- |
 | the system answers | the run goes on | its score | nothing |
-| the system refuses, errors or answers something unusable (the adapter raises `SystemFailed`, or `reading()` does) | the row is recorded as failed, with the traceback of where it was raised, and the run goes on | `zero` | nothing; its error is in `scores.jsonl` and `records/<id>.json` |
-| the system times out, or keeps answering 429 or 5xx | the row is recorded as failed, and the run goes on; an answer that comes after the timeout counts as a timeout | `zero` | optionally resume it with `retry_failed=True` |
+| the system refuses, errors or answers something unusable (the adapter raises `SystemFailed`, or `reading()` does) | the row is recorded as failed, with the traceback of where it was raised, and the run goes on | `score_failure` | nothing; its error is in `scores.jsonl` and `records/<id>.json` |
+| the system times out, or keeps answering 429 or 5xx | the row is recorded as failed, and the run goes on; an answer that comes after the timeout counts as a timeout | `score_failure` | optionally resume it with `retry_failed=True` |
 | your key is missing or wrong, or your account is out of credits | the run stops and says why; a missing key stops it before any call | not yet | fix it, then resume the run |
 | a model server you host isn't running | the run stops and says so | not yet | start it, then resume the run |
 | an adapter's or a scorer's code raises anything else (a bug) | the run stops and the exception is raised as it is, with a note naming the class and the row; an answer `read` crashed on is kept, unread | not yet | fix it (or report it to the package's authors); resume the run after the fix, which reads kept answers again with no call |
@@ -467,7 +467,7 @@ Each is optional, and described in its class's docstring.
 | to run several systems at once, sharing one rate limit | run each in its own thread or process; to share a limit, give each run an `executor` factory that returns one shared pool |
 | to run each row somewhere else (processes, a cluster) | `executor=` on `run`, a function that makes a `concurrent.futures.Executor` |
 | to try a scorer without writing results | `b.grade(run, write=False)` |
-| a number for a run you can't finish | `b.grade(run, partial=True)`: unfinished rows fail, scored by `zero`; the summary counts them and names a few, and scores.jsonl has each |
+| a number for a run you can't finish | `b.grade(run, partial=True)`: unfinished rows fail, scored by `score_failure`; the summary counts them and names a few, and scores.jsonl has each |
 
 ## Where to go next
 
