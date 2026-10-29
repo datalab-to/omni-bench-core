@@ -1,7 +1,8 @@
 """Scorers: how a task's predictions are graded.
 
 - `Scorer`: the class to subclass for a way of grading;
-- `Score`: what `Scorer.score` returns for a scored row; and
+- `Score`: what `Scorer.score` returns for a scored row;
+- `check`: refuses scorers a run can't be graded by; and
 - `ask`: sends a judge (an adapter) one question, under the same rules as a system's calls.
 """
 
@@ -522,6 +523,23 @@ def _digest(s: Scorer, what: str, x: Any) -> str:
     except (TypeError, ValueError) as exc:
         raise TypeError(f"{s.name} caches its scores, so {what} must be JSON (str, numbers, bools, None, lists, "
                         f"dicts with str keys): {exc}") from None
+
+
+def check(scorers: Sequence[Scorer]) -> None:
+    """Refuses scorers a run can't be graded by, before any call: none, one that isn't a `Scorer` dataclass or has
+    neither `score` nor `score_all`, or two that write one results folder."""
+    for s in scorers:
+        errors.check_dataclass(type(s), Scorer)
+        # Note: `score` can't be abstract, since a scorer that scores rows together writes `score_all` instead;
+        # so a scorer with neither is refused here, before any call, not after the answers are paid for.
+        if type(s).score is Scorer.score and type(s).score_all is Scorer.score_all:
+            raise TypeError(f"{type(s).__name__} has neither score(pred, gold) nor score_all(rows, preds, golds); "
+                            "write score, or score_all to score rows together")
+    if not scorers:
+        raise ValueError("a benchmark needs at least one scorer")
+    if len(names := [s.folder_name for s in scorers]) != len(set(names)):
+        raise ValueError(f"scorers {names} name one results folder twice: the same scorer with the "
+                         "same options")
 
 
 def ask[I](judge: adapter.Adapter[I], x: I, *, timeout: float = 300.0) -> dict[str, Any]:
