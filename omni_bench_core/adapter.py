@@ -129,7 +129,7 @@ class Adapter[I](abc.ABC):
 
     def read(self, raw: Any, x: I) -> Any:
         """The output in a raw answer: what predictions/<id>.json holds and every scorer reads. Raise
-        `errors.SystemFailed` for an unusable answer (the row counts 0). Anything else is a bug: the run stops,
+        `errors.SystemFailed` for an unusable answer (the row fails). Anything else is a bug: the run stops,
         the answer is kept, and resuming the run after the fix reads it again with no call."""
         return raw
 
@@ -271,7 +271,7 @@ class PollRetry:
 @contextlib.contextmanager
 def reading(what: str) -> Iterator[None]:
     """Turns a `ValueError`, `KeyError`, `IndexError`, `TypeError` or `AttributeError` raised inside the block into a
-    `SystemFailed` saying what couldn't be read, so a malformed answer counts 0 instead of stopping the run:
+    `SystemFailed` saying what couldn't be read, so a malformed answer fails its row instead of stopping the run:
 
         with adapter.reading("the job's status"):
             status = resp.json()["status"]
@@ -330,7 +330,7 @@ def check_keys(a: Adapter) -> None:
 def predict[I](a: Adapter[I], x: I, *, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
     """Sends one input to `a`, and returns the row's record. Exceptions follow the one rule:
 
-    - `SystemFailed` is recorded as the row's `error` and counts 0; a transient one (429, 5xx) is retried first,
+    - `SystemFailed` is recorded as the row's `error` and fails the row; a transient one (429, 5xx) is retried first,
       within the row's budget, and an answer after the budget is a `SystemTimeout`;
     - an account failure is raised as a `PermissionError`, and a refused connection as it is, with a note; and
     - anything else is raised as it is. When `read` raised it, it carries the record as `unread`, so the paid

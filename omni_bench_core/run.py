@@ -44,7 +44,7 @@ class Run:
     predictions is a run with no system (`Run.at`, `brought`), graded over the whole manifest. Each row is:
 
         answered   it has a prediction;
-        failed     it has a record of a `SystemFailed`, which counts 0; or
+        failed     it has a record of a `SystemFailed`, which fails it; or
         missing    it has neither (never predicted, or its answer is still unread after a bug in `read`).
 
     A run is finished when no row is missing; grading refuses one that isn't."""

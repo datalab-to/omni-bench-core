@@ -52,7 +52,7 @@ class Benchmark:
        same question;
     2. grading reports only a finished run (every row answered or failed, and scored); otherwise it refuses
        and names the rows, and `partial=True` counts them 0; and
-    3. a row counts 0 only when code raises `SystemFailed`. Any other exception stops the run and is raised as
+    3. a row fails only when code raises `SystemFailed`, and the scorer's `zero` scores it. Any other exception stops the run and is raised as
        it is; the answers already paid for are kept.
 
     Methods:
@@ -227,8 +227,8 @@ class Benchmark:
         spent = "" if cost["usd"] is None else f", cost ${cost['usd']:.2f}"
         for name, s in graded.items():
             n = (p := s.get("partial", {})) and p["no_answer"] + p["not_scored"]
-            part = f", PARTIAL: {n} unfinished rows counted 0, each a failed line in scores.jsonl" if n else ""
-            log.info("%s %s: headline %s; %d failed%s%s", r.name, name, _headline(s), s["failed"], spent, part)
+            part = f", PARTIAL: {n} unfinished rows counted as failed, each a line in scores.jsonl" if n else ""
+            log.info("%s %s: headline %s%s%s", r.name, name, _headline(s), spent, part)
         return {"run": r.name, "cost": cost, "scorers": graded}
 
     def run(self, system: adapter.Adapter, out: str | Path, *,
@@ -288,12 +288,11 @@ class Benchmark:
 
 
 def _headline(s: dict[str, Any]) -> str:
-    """A summary's headline as the log line shows it: the scorer's number over the scored rows times coverage."""
-    # Note: coverage as a count, since a share rounds 7665/7667 to 1.000; four decimals so the product checks.
-    if s["scored"] is None: return f"{s['headline']:.4f}: none of the {s['rows']} rows was scored"
-    sc = s["scored"]
-    return (f"{s['headline']:.4f} = {sc['headline']:.4f} ({sc['headline_is']}) × coverage "
-            f"{s['rows'] - s['failed'] + s['zeroed']}/{s['rows']}")
+    """A summary's headline as the log line shows it, with how many rows were scored and why the rest failed."""
+    # Note: scored as a count, since a share rounds 7665/7667 to 1.000.
+    failed = ", ".join(f"{n} {c}" for c, n in s["failed"].items() if n) or "none"
+    return (f"{s['headline']:.4f} ({s['headline_is']}); {s['rows'] - sum(s['failed'].values())}/{s['rows']} scored, "
+            f"failed: {failed}")
 
 
 def predict_row(t: task.Task, system: adapter.Adapter, row: data.Row, timeout: float) -> dict[str, Any]:
