@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import copy
 import difflib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -189,11 +189,14 @@ def plan(c: Config, b: core.Benchmark, s: adapter.Adapter, out: str | Path, **kw
                   workers=c.workers, **kw)
 
 
-def resolved(c: Config, b: core.Benchmark, s: adapter.Adapter) -> dict[str, Any]:
-    """The config as plain JSON, its scorers' and its system's options as `b`'s scorers and `s` take them (their
-    defaults filled in), and a dataset folder as its full path, so the config reads the same folder from anywhere."""
+def resolved(c: Config, scorers: Sequence[scorer.Scorer], s: adapter.Adapter) -> dict[str, Any]:
+    """The config as plain JSON, its scorers' and its system's options as `scorers` (`scorers(c, known)`) and `s`
+    take them (their defaults filled in), and a dataset folder as its full path, so the config reads the same folder
+    from anywhere. It reads no dataset, so a config can be resolved where its dataset isn't (a run launched elsewhere);
+    the scorers are checked as a benchmark checks them (`scorer.check`)."""
+    scorer.check(scorers)
     by: dict[str, list[dict[str, Any]]] = {}
-    for x in b.scorers: by.setdefault(x.name, []).append(x.options())
+    for x in scorers: by.setdefault(x.name, []).append(x.options())
     out = {**c.model_dump(mode="json"), "scorers": {k: v[0] if len(v) == 1 else v for k, v in by.items()},
            "system": {next(iter(c.system)): s.options()}}
     if out["dataset"] and Path(out["dataset"]).is_dir():
@@ -208,7 +211,7 @@ def write(c: Config, b: core.Benchmark, s: adapter.Adapter, folder: str | Path) 
 
     path = Path(folder) / FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(resolved(c, b, s), sort_keys=False, width=1000, allow_unicode=True))
+    path.write_text(yaml.safe_dump(resolved(c, b.scorers, s), sort_keys=False, width=1000, allow_unicode=True))
     return path
 
 

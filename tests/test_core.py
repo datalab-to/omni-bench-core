@@ -1141,7 +1141,11 @@ def test_a_config_is_one_run_written_out_and_its_run_keeps_it_whole(tmp: Path) -
     assert config.plan(kept, b, s, tmp / "runs", resume=p.run.name).run.folder == p.run.folder
     # a dataset folder is kept as its full path, so the config reads the same folder from anywhere
     rel = config.parse({**good, "dataset": os.path.relpath(good["dataset"])}, "rel")
-    assert config.resolved(rel, b, s)["dataset"] == str(Path(good["dataset"]).resolve())
+    assert config.resolved(rel, b.scorers, s)["dataset"] == str(Path(good["dataset"]).resolve())
+    # resolving reads no dataset: a config whose dataset isn't here resolves as one whose is, its scorers checked
+    gone = config.parse({**good, "dataset": str(tmp / "not-here")}, "gone")
+    assert config.resolved(gone, config.scorers(gone, {"exact": Exact}), s)["scorers"] == {"exact": Exact().options()}
+    refused(config.resolved, gone, [Exact(), Exact()], s, match="name one results folder twice")
     # a template writes every option of the system, at its defaults
     t = config.template(make, "copy", dataset="d", manifest="manifest.parquet", scorers={"exact": {}}, timeout=60)
     assert config.parse(t, "t").system == {"copy": Copy().options()}

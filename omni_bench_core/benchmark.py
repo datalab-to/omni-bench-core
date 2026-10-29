@@ -83,18 +83,7 @@ class Benchmark:
         if fields := [f.name for f in dataclasses.fields(self.task)]:
             raise TypeError(f"{type(self.task).__name__} has fields {', '.join(fields)}, but a task has no options: "
                             "what varies between runs is the dataset, the manifest, a scorer or the system")
-        for s in self.scorers:
-            errors.check_dataclass(type(s), scorer.Scorer)
-            # Note: `score` can't be abstract, since a scorer that scores rows together writes `score_all` instead;
-            # so a scorer with neither is refused here, before any call, not after the answers are paid for.
-            if type(s).score is scorer.Scorer.score and type(s).score_all is scorer.Scorer.score_all:
-                raise TypeError(f"{type(s).__name__} has neither score(pred, gold) nor score_all(rows, preds, golds); "
-                                "write score, or score_all to score rows together")
-        if not self.scorers:
-            raise ValueError("a benchmark needs at least one scorer")
-        if len(names := [s.folder_name for s in self.scorers]) != len(set(names)):
-            raise ValueError(f"scorers {names} name one results folder twice: the same scorer with the "
-                             "same options")
+        scorer.check(self.scorers)
 
     def rows(self) -> tuple[data.Row, ...]:
         """Every row of the manifest."""
