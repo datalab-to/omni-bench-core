@@ -236,6 +236,7 @@ wherever the data is read from.
 
 A scorer is one way of grading: a frozen dataclass whose fields are its options. You write:
 
+- `headline`, a class attribute: the key of its summary that runs are compared by;
 - `gold(row)`, abstract: reads the row's gold and checks it;
 - `score(pred, gold)`: compares one prediction with its gold and returns a `Score` (or write `score_all`);
 - `score_failure(gold)`, abstract: a failed row's score, the worst the row can get in the scorer's units; and
@@ -247,6 +248,8 @@ and optional `details`, a larger breakdown written to `details/<id>.jsonl`.
 ```python
 @dataclasses.dataclass(frozen=True)
 class Exact(scorer.Scorer):
+    headline = "exact"                                        # the summary's key runs are compared by
+
     def gold(self, row: Doc) -> str:
         return json.loads(row.gt_path.read_text())["text"]
 
@@ -262,7 +265,7 @@ class Exact(scorer.Scorer):
 
     def summarize(self, lines: list[dict]) -> dict:           # every row's line as one summary
         exact = sum(x["exact"] for x in lines) / len(lines)
-        return {"headline": exact, "headline_is": "exact", "exact": exact}
+        return {"exact": exact}
 ```
 
 Grading turns each row into one line of `scores.jsonl`, and all the lines into one summary:
@@ -296,12 +299,11 @@ rows (a page with 40 tests against a page with 2, a long page against a short on
 failure costs; and since the failure is a line like any other, every number the summary holds counts it, per
 suite as well as the headline.
 
-`summarize` is the handoff. It gets every row's line, without its status, and returns `headline`, a number from
-0 to 1 where higher is better, and `headline_is`, what it is; anything else is the scorer's. The core adds
-`rows`, `failed` (by cause) and `coverage`, the share of rows scored, and refuses a summary that uses one of
-those keys. How a headline is built is the scorer's choice: a mean over rows, a share pooled over characters,
-tests grouped and averaged.
-A headline outside 0 to 1 is refused. `Scorer.grade`, which does all this, can't be overridden.
+`summarize` is the handoff. It gets every row's line, without its status, and returns the scorer's numbers. The
+core adds `rows`, `failed` (by cause), `coverage` (the share of rows scored), and the headline: `headline`, the
+value of the key the scorer's `headline` names, and `headline_is`, that key. It refuses a summary that uses one
+of those keys, or whose headline isn't a number from 0 to 1 where higher is better. How a headline is built is
+the scorer's choice: a mean over rows, a share pooled over characters, tests grouped and averaged. `Scorer.grade`, which does all this, can't be overridden.
 
 ### How scoring runs
 

@@ -38,7 +38,8 @@ POOLS = ("process", "thread")
 # (`prediction` raised `SystemFailed`, or the file isn't JSON); "no_answer": it has no prediction; "not_scored": a
 # partial grading left it unscored. A finished run's rows fail only by the first two.
 CAUSES = ("system", "unusable", "no_answer", "not_scored")
-FRAME = ("scorer", "options", "run", "rows", "failed", "coverage", "partial")   # the summary's keys the core writes
+# the summary's keys the core writes
+FRAME = ("scorer", "options", "run", "rows", "failed", "coverage", "headline", "headline_is", "partial")
 
 
 class Score(NamedTuple):
@@ -68,6 +69,8 @@ class Scorer[R: data.Row, G, P](abc.ABC):
 
         @dataclasses.dataclass(frozen=True)
         class Exact(scorer.Scorer):
+            headline = "exact"                    # the summary's key runs are compared by
+
             def gold(self, row):                  # the row's gold, read and checked
                 return json.loads(row.gt_path.read_text())["text"]
 
@@ -78,10 +81,11 @@ class Scorer[R: data.Row, G, P](abc.ABC):
                 return scorer.Score({"exact": False})
 
             def summarize(self, lines):           # every row's line as one summary
-                return {"headline": sum(x["exact"] for x in lines) / len(lines), "headline_is": "exact"}
+                return {"exact": sum(x["exact"] for x in lines) / len(lines)}
 
-    `gold`, `score_failure` and `summarize` are abstract; `score` is required unless `score_all` is written instead.
-    Optional, with defaults:
+    `headline` is required: the key of the summary runs are compared by, a number from 0 to 1 where higher is
+    better. `gold`, `score_failure` and `summarize` are abstract; `score` is required unless `score_all` is written
+    instead. Optional, with defaults:
 
         name            the scorer's name; the class's name in snake case
         prediction      what the scorer reads of a prediction; the prediction itself
@@ -113,6 +117,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
     """
 
     name: ClassVar[str]
+    headline: ClassVar[str]
     workers: ClassVar[int] = 1
     pool: ClassVar[str] = "process"
     cache: ClassVar[bool] = False
@@ -183,8 +188,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         "row" (if any), ...the result's values}`, without its status: a summary is the same whether a row failed
         or answered as badly as possible.
 
-        Return `headline`, a number from 0 to 1 where higher is better, and `headline_is`, what it is
-        ("accuracy"); anything else is the scorer's own, except the keys the core writes (`FRAME`)."""
+        Return the scorer's numbers, `headline` among them; any key but those the core writes (`FRAME`)."""
 
     def check_gold(self, rows: Sequence[R]) -> None:
         """Refuses, before any call, a dataset whose gold this scorer can't read. Reads every gold by default."""
@@ -390,15 +394,13 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         return x.result
 
     def _framed(self, summary: Summary, lines: Sequence[Line], run: str) -> Summary:
-        """The grading's summary: the core's fields (`FRAME`), then `summarize`'s, checked."""
-        _check_summary(type(self).__name__, summary)
-        if clash := sorted(set(summary) & set(FRAME)):
-            raise ValueError(f"{type(self).__name__}.summarize returned {clash}, which the core writes; name them "
-                             "otherwise")
+        """The grading's summary: the core's fields (`FRAME`), the headline among them, then `summarize`'s,
+        checked."""
+        _check_summary(type(self).__name__, summary, self.headline)
         failed = [x["cause"] for x in lines if x["status"] == "failed"]
         return {"scorer": self.name, "options": self.options(), "run": run, "rows": len(lines),
-                "failed": {c: failed.count(c) for c in CAUSES},
-                "coverage": coverage(lines), **summary}
+                "failed": {c: failed.count(c) for c in CAUSES}, "coverage": coverage(lines),
+                "headline": summary[self.headline], "headline_is": self.headline, **summary}
 
     def _code(self) -> str:
         """A digest of the code the scorer and its judges run: their classes' names and every Python file of
@@ -532,10 +534,13 @@ def _digest(s: Scorer, what: str, x: Any) -> str:
 
 
 def check(scorers: Sequence[Scorer]) -> None:
-    """Refuses scorers a run can't be graded by, before any call: none, one that isn't a `Scorer` dataclass or has
-    neither `score` nor `score_all`, or two that write one results folder."""
+    """Refuses scorers a run can't be graded by, before any call: none, one that isn't a `Scorer` dataclass, has
+    no `headline` or has neither `score` nor `score_all`, or two that write one results folder."""
     for s in scorers:
         errors.check_dataclass(type(s), Scorer)
+        if not (isinstance(h := getattr(type(s), "headline", None), str) and h):
+            raise TypeError(f"{type(s).__name__} has no headline; set headline = \"<key>\", the key of its summary "
+                            "runs are compared by")
         # Note: `score` can't be abstract, since a scorer that scores rows together writes `score_all` instead;
         # so a scorer with neither is refused here, before any call, not after the answers are paid for.
         if type(s).score is Scorer.score and type(s).score_all is Scorer.score_all:
@@ -562,17 +567,19 @@ def coverage(lines: Sequence[Line]) -> float:
     return sum(x["status"] == "scored" for x in lines) / len(lines)
 
 
-def _check_summary(name: str, s: Any) -> None:
-    """Refuses a summary without a `headline` from 0 to 1 and a `headline_is`, or that isn't plain JSON, before
-    anything is written."""
+def _check_summary(name: str, s: Any, headline: str) -> None:
+    """Refuses a summary that isn't plain JSON, uses a key the core writes, or whose `headline` key isn't a number
+    from 0 to 1, before anything is written."""
     errors.plain(s, f"{name}.summarize's summary")
-    if not isinstance(s, dict) or "headline" not in s:
-        raise ValueError(f'{name}.summarize must return a dict with a "headline" key, the number runs are compared '
-                         f"by; it returned {s!r:.120}")
-    h = s["headline"]
+    if not isinstance(s, dict):
+        raise ValueError(f"{name}.summarize must return a dict of its numbers; it returned {s!r:.120}")
+    if clash := sorted(set(s) & set(FRAME)):
+        raise ValueError(f"{name}.summarize returned {clash}, which the core writes; name them otherwise")
+    if headline not in s:
+        raise ValueError(f'{name}.headline is "{headline}", but summarize returned no such key; it returned '
+                         f"{sorted(s)}")
+    h = s[headline]
     if isinstance(h, bool) or not isinstance(h, (int, float)) or not 0 <= h <= 1:
-        raise ValueError(f'{name}.summarize returned "headline": {h!r}; it must be a number from 0 to 1 where higher '
-                         "is better, so every headline reads one way (for an error rate, return 1 - rate)")
-    if not (isinstance(s.get("headline_is"), str) and s["headline_is"].strip()):
-        raise ValueError(f'{name}.summarize must return a "headline_is" key saying what its headline is '
-                         '(e.g. "accuracy")')
+        raise ValueError(f'{name}.summarize returned "{headline}": {h!r}, its headline; it must be a number from 0 '
+                         "to 1 where higher is better, so every headline reads one way (for an error rate, give "
+                         "1 - rate)")

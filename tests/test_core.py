@@ -88,6 +88,8 @@ class Copy(adapter.Adapter):
 
 @dataclasses.dataclass(frozen=True)
 class Exact(scorer.Scorer):
+    headline: ClassVar[str] = "exact"
+
     def gold(self, row: Doc) -> str:
         got = json.loads(row.gt_path.read_text())
         if not isinstance(got.get("text"), str): raise ValueError(f'{row.gt_path} holds {got}, not {{"text": ...}}')
@@ -107,7 +109,7 @@ class Exact(scorer.Scorer):
 
     def summarize(self, lines):
         exact = sum(x["exact"] for x in lines) / len(lines)
-        return {"headline": exact, "headline_is": "exact", "exact": exact,
+        return {"exact": exact,
                 "length": sum(x["length"] for x in lines) / len(lines)}
 
 
@@ -139,6 +141,7 @@ class Judge(adapter.Adapter):
 
 @dataclasses.dataclass(frozen=True)
 class Agree(Exact):
+    headline: ClassVar[str] = "agree"
     cache: ClassVar[bool] = True
     pool: ClassVar[str] = "thread"
     workers: ClassVar[int] = 4
@@ -154,7 +157,7 @@ class Agree(Exact):
 
     def summarize(self, lines):
         agree = sum(x["agree"] for x in lines) / len(lines)
-        return {"headline": agree, "headline_is": "agree", "agree": agree,
+        return {"agree": agree,
                 "judge_usd": sum(x["judge_usd"] for x in lines) / len(lines)}
 
 
@@ -200,6 +203,7 @@ def test_gold_echo_scores_one(tmp: Path) -> None:
     name = g["run"]
     s = g["scorers"]["exact"]
     assert s["headline"] == 1.0 and s["exact"] == 1.0 and s["length"] == 5.0 and s["headline_is"] == "exact", s
+    assert list(s)[:8] == ["scorer", "options", "run", "rows", "failed", "coverage", "headline", "headline_is"], s
     assert s["failed"] == {"system": 0, "unusable": 0, "no_answer": 0, "not_scored": 0} and s["coverage"] == 1.0, s
     assert g["cost"] == {"usd": None, "credits": None}
     assert (tmp / "runs" / name / "exact" / "scores.jsonl").exists()
@@ -490,6 +494,8 @@ def test_a_summary_key_the_core_writes_is_refused(tmp: Path) -> None:
 class Chars(Exact):
     """The share of gold characters matched, pooled over rows, so a long row weighs more than a short one."""
 
+    headline: ClassVar[str] = "chars"
+
     def score(self, pred: str, gold: str) -> scorer.Score:
         return scorer.Score({"right": sum(a == b for a, b in zip(pred, gold)), "chars": len(gold)})
 
@@ -500,7 +506,7 @@ class Chars(Exact):
         return {"lang": row.extra["lang"]}
 
     def summarize(self, lines):
-        return {"headline": sum(x["right"] for x in lines) / sum(x["chars"] for x in lines), "headline_is": "chars"}
+        return {"chars": sum(x["right"] for x in lines) / sum(x["chars"] for x in lines)}
 
 
 def test_score_failure_scores_a_failed_row_in_the_scorers_own_units(tmp: Path) -> None:
@@ -898,11 +904,13 @@ class NoScoreFailure(scorer.Scorer):
         return None
 
     def summarize(self, lines):
-        return {"headline": 1.0, "headline_is": "n"}
+        return {"n": 1.0}
 
 
 @dataclasses.dataclass(frozen=True)
 class NoScore(scorer.Scorer):
+    headline: ClassVar[str] = "n"
+
     def gold(self, row):
         return None
 
@@ -910,7 +918,7 @@ class NoScore(scorer.Scorer):
         return scorer.Score({"n": 0})
 
     def summarize(self, lines):
-        return {"headline": 1.0, "headline_is": "n"}
+        return {"n": 1.0}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -937,16 +945,26 @@ class BatchJudge(Exact):
 @dataclasses.dataclass(frozen=True)
 class Headline(Exact):
     value: Any = 2.0
-    what: Any = "exact"
 
     def summarize(self, lines):
-        return {"headline": self.value, "headline_is": self.what}
+        return {"exact": self.value}
 
 
 @dataclasses.dataclass(frozen=True)
-class NoHeadline(Exact):
+class NoHeadlineKey(Exact):
+    headline: ClassVar[str] = "accuracy"
+
+
+@dataclasses.dataclass(frozen=True)
+class NoHeadline(NoSummary):
     def summarize(self, lines):
-        return {"exact": 1.0, "headline_is": "exact"}
+        return {"n": 1.0}
+
+
+@dataclasses.dataclass(frozen=True)
+class WritesHeadline(Exact):
+    def summarize(self, lines):
+        return {**super().summarize(lines), "headline": 1.0}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -961,11 +979,11 @@ def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(
     refused(NoSummary, match="abstract method 'summarize'")             # Python refuses it: summarize is abstract
     refused(NoScoreFailure, match="abstract method 'score_failure'")    # a failed row's score is the scorer's too
     refused(bench, dataset(tmp / "d"), NoScore(), match="NoScore has neither score")
-    for value, what, match in ((2.0, "exact", '"headline": 2.0'), (-0.1, "exact", '"headline": -0.1'),
-                               (True, "exact", '"headline": True'), (None, "exact", '"headline": None'),
-                               (0.5, "", '"headline_is" key')):
-        refused(bench(tmp / "d", Headline(value, what)).run, GoldEcho(), tmp / f"runs-{value}-{what}", match=match)
-    refused(bench(tmp / "d", NoHeadline()).run, GoldEcho(), tmp / "runs-nohead", match='a "headline" key')
+    for value in (2.0, -0.1, True, None):
+        refused(bench(tmp / "d", Headline(value)).run, GoldEcho(), tmp / f"runs-{value}", match=f'"exact": {value}, its headline')
+    refused(bench(tmp / "d", NoHeadlineKey()).run, GoldEcho(), tmp / "runs-nokey", match='headline is "accuracy", but')
+    refused(bench, tmp / "d", NoHeadline(), match="NoHeadline has no headline")
+    refused(bench(tmp / "d", WritesHeadline()).run, GoldEcho(), tmp / "runs-writes", match="returned ['headline'], which the core")
     for status in ("ok", "failed"):     # a result can't say its own status: only the core fails a row
         refused(bench(tmp / "d", Status(status)).run, GoldEcho(), tmp / f"runs-{status}", match="holds ['status']")
     for bad in (BadResult(), BadDetails()):    # what a Score holds is checked as each row is scored
