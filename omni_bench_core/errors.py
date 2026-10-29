@@ -1,10 +1,10 @@
 """The exceptions the core acts on, and helpers for messages.
 
-The one rule: a row counts 0 only when code raises `SystemFailed` on purpose. Any other exception stops the run
+The one rule: a row fails only when code raises `SystemFailed` on purpose. Any other exception stops the run
 and is raised as it is. So:
 
 - `SystemFailed` (and its kinds `SystemTimeout`, `SystemUnreachable` and `Unreadable`): the system failed on one
-  row, which is recorded and counts 0;
+  row, which is recorded and fails;
 - `Unscored`: a scorer couldn't score one row (a judge that didn't answer), which waits for a later grading; and
 - anything else is a native exception (`ValueError` for wrong input, `PermissionError` for an account that
   can't pay, and so on), raised as it is, with a note from `noted` saying which class and which row.
@@ -31,7 +31,7 @@ class Unscored(Exception):
     neither scored nor failed, so grading refuses to report until a later grading scores it. Don't use it for
     what asking again won't change, or the run never finishes:
 
-    - a prediction the scorer can't use: raise `SystemFailed` in `Scorer.prediction`, and the row counts 0;
+    - a prediction the scorer can't use: raise `SystemFailed` in `Scorer.prediction`, and the row fails;
     - a gold the scorer can't read: let it raise, and grading stops and names the row; and
     - a bug: let it raise."""
 
