@@ -524,6 +524,29 @@ def test_score_failure_scores_a_failed_row_in_the_scorers_own_units(tmp: Path) -
 
 
 @dataclasses.dataclass(frozen=True)
+class CharsSkipping(Chars):
+    """`Chars`, leaving b1 unscored, as a judge that didn't answer would."""
+
+    def score_all(self, rows, preds, golds):
+        return [errors.Unscored("skipped") if r.id == "b1" else self.score(p, g)
+                for r, p, g in zip(rows, preds, golds, strict=True)]
+
+
+def test_a_partial_gradings_failed_rows_get_their_failure_details(tmp: Path) -> None:
+    b = bench(dataset(tmp / "d"), CharsSkipping())
+    mine = tmp / "mine"
+    (mine / "predictions").mkdir(parents=True)
+    for i in ("a1", "a2", "b1"):
+        (mine / "predictions" / f"{i}.json").write_text(json.dumps({"text": TEXTS[i][1]}))
+    s = b.grade(mine, partial=True)["scorers"]["chars_skipping"]
+    assert (s["failed"]["no_answer"], s["failed"]["not_scored"]) == (2, 1), s
+    details = mine / "chars_skipping" / "details"
+    assert sorted(p.stem for p in details.iterdir()) == ["b1", "b2", "c1"], "each failed row's, none for a scored one"
+    assert json.loads((details / "b1.jsonl").read_text()) == {"lang": "en", "missed": "123"}
+    refused(CharsSkipping().grade, runs.Run.at(mine), [], match="no rows to grade")
+
+
+@dataclasses.dataclass(frozen=True)
 class Clashes(Chars):
     def detail_fields(self, row: Doc) -> dict[str, Any]:
         return {"missed": 1}
@@ -968,6 +991,12 @@ class WritesHeadline(Exact):
 
 
 @dataclasses.dataclass(frozen=True)
+class Errs(Exact):
+    def score(self, pred, gold):
+        return scorer.Score({"exact": pred == gold, "length": 1, "error": 0.0})
+
+
+@dataclasses.dataclass(frozen=True)
 class Status(Exact):
     status: str = "ok"
 
@@ -986,6 +1015,8 @@ def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(
     refused(bench(tmp / "d", WritesHeadline()).run, GoldEcho(), tmp / "runs-writes", match="returned ['headline'], which the core")
     for status in ("ok", "failed"):     # a result can't say its own status: only the core fails a row
         refused(bench(tmp / "d", Status(status)).run, GoldEcho(), tmp / f"runs-{status}", match="holds ['status']")
+    # nor a key a failed line keeps for its cause, which summarize would never get
+    refused(bench(tmp / "d", Errs()).run, GoldEcho(), tmp / "runs-errs", match="holds ['error']")
     for bad in (BadResult(), BadDetails()):    # what a Score holds is checked as each row is scored
         refused(bench(tmp / "d", bad).run, GoldEcho(), tmp / f"runs-{bad.name}", match=f"{type(bad).__name__} scored row")
     msg = refused(bench(tmp / "d", BatchJudge()).run, GoldEcho(), tmp / "runs-batch", match="1 row not scored")

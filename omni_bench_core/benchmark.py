@@ -51,9 +51,9 @@ class Benchmark:
        after its question and a run id; a launch that names a run (`resume`) continues it, and only for the
        same question;
     2. grading reports only a finished run (every row answered or failed, and scored); otherwise it refuses
-       and names the rows, and `partial=True` counts them 0; and
-    3. a row fails only when code raises `SystemFailed`, and the scorer's `score_failure` scores it. Any other exception stops the run and is raised as
-       it is; the answers already paid for are kept.
+       and names the rows, and `partial=True` counts them failed; and
+    3. a row fails only when code raises `SystemFailed`, and the scorer's `score_failure` scores it. Any other
+       exception stops the run and is raised as it is; the answers already paid for are kept.
 
     Methods:
 
@@ -214,7 +214,7 @@ class Benchmark:
               write: bool = True) -> dict[str, Any]:
         """Grades `run` (or a folder of your own predictions) with each scorer, over the rows it answers. Returns
         the run's name, its cost and each scorer's summary by folder name. An unfinished run is refused with a
-        `ValueError`; `partial=True` counts its unfinished rows 0. `write=False` writes no results."""
+        `ValueError`; `partial=True` counts its unfinished rows failed. `write=False` writes no results."""
         r = run if isinstance(run, runs.Run) else runs.Run.at(run)
         every = self.rows()
         if not r.brought(): r.check_settings(self.question())

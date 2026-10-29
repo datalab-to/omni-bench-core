@@ -35,18 +35,19 @@ type Summary = dict[str, Any]
 SHOWN = 10   # how many ids a message about unfinished rows names
 POOLS = ("process", "thread")
 # Note: why a row failed. "system": its record says the call failed; "unusable": its prediction can't be used
-# (`prediction` raised `SystemFailed`, or the file isn't JSON); "no_answer": it has no prediction; "not_scored": a
-# partial grading left it unscored. A finished run's rows fail only by the first two.
+# (`prediction` raised `SystemFailed`, or the file isn't JSON); "no_answer": it has no prediction (unfinished, in a
+# partial grading, or lost with no output to rebuild it from); "not_scored": a partial grading left it unscored.
 CAUSES = ("system", "unusable", "no_answer", "not_scored")
+LINE = ("id", "status", "row", "cause", "error", "traceback")   # a line's keys the core writes
 # the summary's keys the core writes
 FRAME = ("scorer", "options", "run", "rows", "failed", "coverage", "headline", "headline_is", "partial")
 
 
 class Score(NamedTuple):
-    """A scored row's score. `result` is a small dict of the row's values, mostly numbers, which its line in
-    scores.jsonl holds; it may not use `id`, `status` or `row`, which the core writes. `details` is an optional
-    larger breakdown (a verdict per field, a judge's reasoning), written to `details/<id>.jsonl` and never read
-    by `summarize`."""
+    """A row's score, from `score` or `score_failure`. `result` is a small dict of the row's values, mostly
+    numbers, which its line in scores.jsonl holds; it may not use a key the core writes there (`LINE`). `details`
+    is an optional larger breakdown (a verdict per field, a judge's reasoning), written to `details/<id>.jsonl`
+    and never read by `summarize`."""
 
     result: dict[str, Any]
     details: list[dict[str, Any]] | None = None
@@ -311,7 +312,11 @@ class Scorer[R: data.Row, G, P](abc.ABC):
     def _failed(self, r: R, cause: str, error: str, tb: str | None = None) -> _Failed:
         """A failed row, with the score `score_failure` gives it."""
         assert cause in CAUSES, cause
-        z = self.score_failure(self._gold(r))
+        try:
+            z = self.score_failure(self._gold(r))
+        except Exception as exc:
+            errors.noted(exc, type(self), f"scoring the failure of {r.id}")
+            raise
         if not isinstance(z, Score):
             raise TypeError(f"{type(self).__name__}.score_failure must return a scorer.Score; for row {r.id} it "
                             f"returned a {type(z).__name__}")
@@ -363,12 +368,12 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         errors.plain(f, f"{self.name}.row_fields for row {r.id}")
         match x:
             case Score():
-                return {"id": r.id, "status": "scored", **row, **self._result(r, x, ())}
+                return {"id": r.id, "status": "scored", **row, **self._result(r, x)}
             case errors.Unscored():
                 return {"id": r.id, "status": "unscored", **row, "error": errors.capped(str(x))}
             case _Failed():
                 return {"id": r.id, "status": "failed", "cause": x.cause, **row,
-                        **self._result(r, x.score, ("cause", "error", "traceback")), "error": errors.capped(x.error),
+                        **self._result(r, x.score), "error": errors.capped(x.error),
                         **({"traceback": errors.capped(x.traceback)} if x.traceback else {})}
             case _:
                 raise AssertionError(x)
@@ -385,10 +390,10 @@ class Scorer[R: data.Row, G, P](abc.ABC):
                              "them otherwise")
         return [f | d for d in x.details]
 
-    def _result(self, r: R, x: Score, kept: tuple[str, ...]) -> dict[str, Any]:
-        """A score's values for the row's line, refused if they use a key the line keeps for the core (`id`,
-        `status`, `row`, and `kept`)."""
-        if clash := sorted(set(x.result) & {"id", "status", "row", *kept}):
+    def _result(self, r: R, x: Score) -> dict[str, Any]:
+        """A score's values for the row's line, refused if they use a key the line keeps for the core (`LINE`),
+        scored or failed alike, so `summarize` gets every value a result holds."""
+        if clash := sorted(set(x.result) & set(LINE)):
             raise ValueError(f"{self.name}'s result for row {r.id} holds {clash}, which its line keeps for the core; "
                              "name them otherwise")
         return x.result
