@@ -74,7 +74,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
             def score(self, pred, gold):          # one row's numbers
                 return scorer.Score({"exact": pred["text"] == gold})
 
-            def zero(self, row, gold):            # a failed row, as the worst score
+            def zero(self, gold):                 # a failed row, as the worst score
                 return scorer.Score({"exact": False})
 
             def summarize(self, lines):           # every row's line as one summary
@@ -106,7 +106,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
           gold(row), prediction(output)     each row's gold and prediction, read once
           score_all(rows, preds, golds)     `batch_size` rows at a time, without kept scores
             score(pred, gold)               one row
-          zero(row, gold)                   a failed row's score
+          zero(gold)                        a failed row's score
           row_fields(row)                   each line's "row"
           detail_fields(row)                each detail line's fields from the row
           summarize(lines)                  every row's line, scored or zeroed, as one summary
@@ -171,7 +171,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         return {}
 
     @abc.abstractmethod
-    def zero(self, row: R, gold: G) -> Score:
+    def zero(self, gold: G) -> Score:
         """A failed row's score: the worst score the row can get, in the scorer's own units (every test failed,
         every gold character missed). `summarize` gets it as it gets a scored row's, so every number the summary
         holds counts the failure, weighed as the scorer weighs rows. Not `score` of an empty answer, which can
@@ -307,7 +307,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
     def _failed(self, r: R, cause: str, error: str, tb: str | None = None) -> _Failed:
         """A failed row, with the score `zero` gives it."""
         assert cause in CAUSES, cause
-        z = self.zero(r, self._gold(r))
+        z = self.zero(self._gold(r))
         if not isinstance(z, Score):
             raise TypeError(f"{type(self).__name__}.zero must return a scorer.Score; for row {r.id} it returned a "
                             f"{type(z).__name__}")

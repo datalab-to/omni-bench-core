@@ -102,7 +102,7 @@ class Exact(scorer.Scorer):
         diffs = [{"at": i, "pred": a, "gold": b} for i, (a, b) in enumerate(zip(pred, gold)) if a != b]
         return scorer.Score({"exact": pred == gold, "length": len(pred)}, diffs or None)
 
-    def zero(self, row: Doc, gold: str) -> scorer.Score:
+    def zero(self, gold: str) -> scorer.Score:
         return scorer.Score({"exact": False, "length": 0})
 
     def summarize(self, lines):
@@ -149,7 +149,7 @@ class Agree(Exact):
         return scorer.Score({"agree": rec["output"]["verdict"] == "yes", "judge_usd": rec["cost"]["usd"]},
                             [rec["output"]])
 
-    def zero(self, row: Doc, gold: str) -> scorer.Score:
+    def zero(self, gold: str) -> scorer.Score:
         return scorer.Score({"agree": False, "judge_usd": 0.0})
 
     def summarize(self, lines):
@@ -493,7 +493,7 @@ class Chars(Exact):
     def score(self, pred: str, gold: str) -> scorer.Score:
         return scorer.Score({"right": sum(a == b for a, b in zip(pred, gold)), "chars": len(gold)})
 
-    def zero(self, row: Doc, gold: str) -> scorer.Score:
+    def zero(self, gold: str) -> scorer.Score:
         return scorer.Score({"right": 0, "chars": len(gold)}, [{"missed": gold}])
 
     def detail_fields(self, row: Doc) -> dict[str, Any]:
@@ -885,7 +885,7 @@ class NoSummary(scorer.Scorer):
     def gold(self, row):
         return None
 
-    def zero(self, row, gold):
+    def zero(self, gold):
         return scorer.Score({"n": 0})
 
     def score(self, pred, gold):
@@ -906,7 +906,7 @@ class NoScore(scorer.Scorer):
     def gold(self, row):
         return None
 
-    def zero(self, row, gold):
+    def zero(self, gold):
         return scorer.Score({"n": 0})
 
     def summarize(self, lines):

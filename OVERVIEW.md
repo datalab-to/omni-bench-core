@@ -238,7 +238,7 @@ A scorer is one way of grading: a frozen dataclass whose fields are its options.
 
 - `gold(row)`, abstract: reads the row's gold and checks it;
 - `score(pred, gold)`: compares one prediction with its gold and returns a `Score` (or write `score_all`);
-- `zero(row, gold)`, abstract: a failed row's score, the worst the row can get in the scorer's units; and
+- `zero(gold)`, abstract: a failed row's score, the worst the row can get in the scorer's units; and
 - `summarize(lines)`, abstract: every row's line as one summary.
 
 A `Score` holds `result`, a small dict of the row's values, mostly numbers (`{"exact": True, "length": 5}`),
@@ -257,7 +257,7 @@ class Exact(scorer.Scorer):
         diffs = [{"at": i, "pred": a, "gold": b} for i, (a, b) in enumerate(zip(pred, gold)) if a != b]
         return scorer.Score({"exact": pred == gold, "length": len(pred)}, diffs or None)
 
-    def zero(self, row: Doc, gold: str) -> scorer.Score:      # a failed row, as the worst score
+    def zero(self, gold: str) -> scorer.Score:                # a failed row, as the worst score
         return scorer.Score({"exact": False, "length": 0})
 
     def summarize(self, lines: list[dict]) -> dict:           # every row's line as one summary
@@ -289,7 +289,7 @@ the core fails a row, for one of four causes: its record says the call failed (`
 `SystemFailed` or the file isn't JSON (`unusable`), it has no prediction (`no_answer`), or a partial grading left
 it unscored (`not_scored`).
 
-A failed row still has a score: `zero(row, gold)`, the worst score the row can get in the scorer's own units
+A failed row still has a score: `zero(gold)`, the worst score the row can get in the scorer's own units
 (every test failed, every gold character missed). It isn't the score of an empty answer, which can be better
 than the worst: an empty page passes a test that a text is absent. Since only the scorer knows how it weighs
 rows (a page with 40 tests against a page with 2, a long page against a short one), only it can say what a
