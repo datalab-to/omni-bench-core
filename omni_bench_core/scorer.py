@@ -40,7 +40,7 @@ POOLS = ("process", "thread")
 CAUSES = ("system", "unusable", "no_answer", "not_scored")
 LINE = ("id", "status", "row", "cause", "error", "traceback")   # a line's keys the core writes
 # the summary's keys the core writes
-FRAME = ("scorer", "options", "run", "rows", "failed", "coverage", "headline", "headline_is", "answered", "partial")
+FRAME = ("scorer", "options", "run", "rows", "failed", "coverage", "headline", "headline_is", "partial")
 
 
 class Score(NamedTuple):
@@ -192,8 +192,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         "row" (if any), ...the result's values}`, without its status: a summary is the same whether a row failed
         or answered as badly as possible.
 
-        Return the scorer's numbers, `headline` among them; any key but those the core writes (`FRAME`). It is
-        called twice: over every row for the summary, and over the scored rows alone for its `answered`."""
+        Return the scorer's numbers, `headline` among them; any key but those the core writes (`FRAME`)."""
 
     def check_gold(self, rows: Sequence[R]) -> None:
         """Refuses, before any call, a dataset whose gold this scorer can't read. Reads every gold by default."""
@@ -229,9 +228,9 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         3. for each batch of `batch_size` rows: fails the rows the core knows failed (`score_failure`), reuses kept
            scores, scores the rest (`score_all`), and writes their details;
         4. refuses unscored rows, unless `partial`, which fails them;
-        5. summarizes every row's line (`summarize`), checks the summary, and adds the core's fields: `rows`,
-           `failed` by cause (`CAUSES`), `coverage`, the share of rows scored, and `answered`, the summary of the
-           scored rows alone (None when none was); and
+        5. checks that failed rows' results have the scored rows' keys, summarizes every row's line (`summarize`),
+           checks the summary, and adds the core's fields: `rows`, `failed` by cause (`CAUSES`), and `coverage`,
+           the share of rows scored; and
         6. writes scores.jsonl and summary.json, only when grading finishes.
 
         `write=False` writes no results, though it may still rebuild a prediction or fill the cache."""
@@ -279,11 +278,6 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         _same_keys(type(self).__name__, lines)
         ys = [{k: v for k, v in x.items() if k not in ("status", "cause", "error", "traceback")} for x in lines]
         summary = self._framed(self.summarize(ys), lines, run.name)
-        # Note: the answered rows alone, to tell a bad answer from no answer; a run's numbers are the summary's.
-        scored = [y for x, y in zip(lines, ys, strict=True) if x["status"] == "scored"]
-        answered = self.summarize(scored) if scored else None
-        if answered is not None: _check_summary(type(self).__name__, answered, self.headline)
-        summary["answered"] = answered
         # Note: counts and a few ids, not every id, which a run stopped early would have thousands of.
         if missing or unscored:
             summary["partial"] = {"no_answer": len(missing), "not_scored": len(unscored),
