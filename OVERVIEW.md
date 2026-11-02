@@ -239,7 +239,7 @@ A scorer is one way of grading: a frozen dataclass whose fields are its options.
 - `headline`, a class attribute: the key of its summary that runs are compared by;
 - `gold(row)`, abstract: reads the row's gold and checks it;
 - `score(pred, gold)`: compares one prediction with its gold and returns a `Score` (or write `score_all`);
-- `score_failure(gold)`, abstract: a failed row's score, the worst the row can get in the scorer's units; and
+- `score_failure(gold)`, abstract: a failed row's score, no credit in the scorer's units; and
 - `summarize(lines)`, abstract: every row's line as one summary.
 
 A `Score` holds `result`, a small dict of the row's values, mostly numbers (`{"exact": True, "length": 5}`),
@@ -260,7 +260,7 @@ class Exact(scorer.Scorer):
         diffs = [{"at": i, "pred": a, "gold": b} for i, (a, b) in enumerate(zip(pred, gold)) if a != b]
         return scorer.Score({"exact": pred == gold, "length": len(pred)}, diffs or None)
 
-    def score_failure(self, gold: str) -> scorer.Score:       # a failed row, as the worst score
+    def score_failure(self, gold: str) -> scorer.Score:       # a failed row: no credit
         return scorer.Score({"exact": False, "length": 0})
 
     def summarize(self, lines: list[dict]) -> dict:           # every row's line as one summary
@@ -278,7 +278,8 @@ Grading turns each row into one line of `scores.jsonl`, and all the lines into o
                                                          summarize
                                                              v
            {"rows": 3, "failed": {"system": 1, "unusable": 0, "no_answer": 0, "not_scored": 0},
-            "coverage": 0.667, "headline": 0.333, "headline_is": "exact", "exact": 0.333}
+            "coverage": 0.667, "headline": 0.333, "headline_is": "exact", "exact": 0.333,
+            "answered": {"exact": 0.5}}
 ```
 
 A line is one row's grade. The core writes `id`, `status` and `row` (from `row_fields`), then the row's
@@ -292,9 +293,12 @@ the core fails a row, for one of four causes: its record says the call failed (`
 `SystemFailed` or the file isn't JSON (`unusable`), it has no prediction (`no_answer`), or a partial grading left
 it unscored (`not_scored`).
 
-A failed row still has a score: `score_failure(gold)`, the worst score the row can get in the scorer's own units
-(every test failed, every gold character missed). It isn't the score of an empty answer, which can be better
-than the worst: an empty page passes a test that a text is absent. Since only the scorer knows how it weighs
+A failed row still has a score: `score_failure(gold)`, no credit in the scorer's own units (every test failed,
+every gold character missed). It isn't always the score of an empty answer, which can earn credit: an empty page
+passes a test that a text is absent. Nor is it always the worst score: where an answer's cost has no bound (edits
+pooled over characters, invented changes), a bad answer can cost more than a failure. So a row fails only when the
+system gave no usable answer, never because its answer was bad; an adapter or a scorer that raised `SystemFailed`
+to filter bad answers would let a system gain by failing. Since only the scorer knows how it weighs
 rows (a page with 40 tests against a page with 2, a long page against a short one), only it can say what a
 failure costs; and since the failure is a line like any other, every number the summary holds counts it, per
 suite as well as the headline.
@@ -303,7 +307,13 @@ suite as well as the headline.
 core adds `rows`, `failed` (by cause), `coverage` (the share of rows scored), and the headline: `headline`, the
 value of the key the scorer's `headline` names, and `headline_is`, that key. It refuses a summary that uses one
 of those keys, or whose headline isn't a number from 0 to 1 where higher is better. How a headline is built is
-the scorer's choice: a mean over rows, a share pooled over characters, tests grouped and averaged. `Scorer.grade`, which does all this, can't be overridden.
+the scorer's choice: a mean over rows, a share pooled over characters, tests grouped and averaged.
+
+`answered` is `summarize` again, over the scored rows alone (None when none was): how good the answers were, apart
+from how many there were, so a run with timeouts doesn't read as a model that misses fields. It is for diagnosing
+a system, not for ranking: a system that fails its hardest rows looks better there. The core also refuses a grading
+whose failed rows' results hold other keys than its scored rows', so a `score_failure` out of step with `score` is
+named as such rather than met as a `KeyError` in `summarize`. `Scorer.grade`, which does all this, can't be overridden.
 
 ### How scoring runs
 

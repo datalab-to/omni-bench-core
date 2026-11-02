@@ -516,6 +516,7 @@ def test_score_failure_scores_a_failed_row_in_the_scorers_own_units(tmp: Path) -
     # c1's 9 characters count as missed, so 16/25, where a failed row as one row's 0 would give 4/5
     assert s["failed"] == {"system": 1, "unusable": 0, "no_answer": 0, "not_scored": 0} and s["coverage"] == 0.8 and abs(s["headline"] - 16 / 25) < 1e-9, s
     assert abs(g["scorers"]["exact"]["headline"] - 0.8) < 1e-9
+    assert s["answered"] == {"chars": 1.0}, "the answered rows alone: every one right"
     lines = {x["id"]: x for x in map(json.loads, (tmp / "runs" / g["run"] / "chars" / "scores.jsonl").open())}
     assert lines["c1"]["status"] == "failed" and lines["c1"]["chars"] == 9 and "refused" in lines["c1"]["error"]
     c1 = json.loads((tmp / "runs" / g["run"] / "chars" / "details" / "c1.jsonl").read_text())
@@ -985,6 +986,14 @@ class NoHeadline(NoSummary):
 
 
 @dataclasses.dataclass(frozen=True)
+class OffKeys(Exact):
+    """A `score_failure` out of step with `score`: it leaves out `length`."""
+
+    def score_failure(self, gold):
+        return scorer.Score({"exact": False})
+
+
+@dataclasses.dataclass(frozen=True)
 class WritesHeadline(Exact):
     def summarize(self, lines):
         return {**super().summarize(lines), "headline": 1.0}
@@ -1012,6 +1021,7 @@ def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(
         refused(bench(tmp / "d", Headline(value)).run, GoldEcho(), tmp / f"runs-{value}", match=f'"exact": {value}, its headline')
     refused(bench(tmp / "d", NoHeadlineKey()).run, GoldEcho(), tmp / "runs-nokey", match='headline is "accuracy", but')
     refused(bench, tmp / "d", NoHeadline(), match="NoHeadline has no headline")
+    refused(bench(tmp / "d", OffKeys()).run, Copy(), tmp / "runs-offkeys", match="gave row c1 the keys ['exact'], where")
     refused(bench(tmp / "d", WritesHeadline()).run, GoldEcho(), tmp / "runs-writes", match="returned ['headline'], which the core")
     for status in ("ok", "failed"):     # a result can't say its own status: only the core fails a row
         refused(bench(tmp / "d", Status(status)).run, GoldEcho(), tmp / f"runs-{status}", match="holds ['status']")
@@ -1025,6 +1035,7 @@ def test_the_scorer_summarizes_the_scored_rows_and_the_core_checks_its_headline(
     assert s["failed"]["not_scored"] == 1 and s["partial"]["not_scored"] == 1 and s["headline"] == 0.8, s
     every = dataset(tmp / "refused", {"r1": ("", "refuse 1"), "r2": ("", "refuse 2")})
     s = bench(every).run(Copy(), tmp / "runs-none")["scorers"]["exact"]
+    assert s["answered"] is None, s                                     # no row answered
     assert s["headline"] == 0.0 and s["coverage"] == 0.0 and s["failed"]["system"] == 2, s   # every row failed
 
 

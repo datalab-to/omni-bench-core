@@ -40,7 +40,7 @@ POOLS = ("process", "thread")
 CAUSES = ("system", "unusable", "no_answer", "not_scored")
 LINE = ("id", "status", "row", "cause", "error", "traceback")   # a line's keys the core writes
 # the summary's keys the core writes
-FRAME = ("scorer", "options", "run", "rows", "failed", "coverage", "headline", "headline_is", "partial")
+FRAME = ("scorer", "options", "run", "rows", "failed", "coverage", "headline", "headline_is", "answered", "partial")
 
 
 class Score(NamedTuple):
@@ -78,7 +78,7 @@ class Scorer[R: data.Row, G, P](abc.ABC):
             def score(self, pred, gold):          # one row's numbers
                 return scorer.Score({"exact": pred["text"] == gold})
 
-            def score_failure(self, gold):        # a failed row, as the worst score
+            def score_failure(self, gold):        # a failed row: no credit
                 return scorer.Score({"exact": False})
 
             def summarize(self, lines):           # every row's line as one summary
@@ -178,10 +178,13 @@ class Scorer[R: data.Row, G, P](abc.ABC):
 
     @abc.abstractmethod
     def score_failure(self, gold: G) -> Score:
-        """A failed row's score: the worst score the row can get, in the scorer's own units (every test failed,
-        every gold character missed). `summarize` gets it as it gets a scored row's, so every number the summary
-        holds counts the failure, weighed as the scorer weighs rows. Not `score` of an empty answer, which can
-        score above the worst (an empty page passes a test that a text is absent)."""
+        """A failed row's score: no credit, in the scorer's own units (every test failed, every gold character
+        missed). `summarize` gets it as it gets a scored row's, so every number the summary holds counts the
+        failure, weighed as the scorer weighs rows. Not always `score` of an empty answer, which can earn credit
+        (an empty page passes a test that a text is absent). Nor always the worst score: where an answer's cost
+        has no bound (pooled edits, invented changes), a bad answer can cost more than a failure. So a system
+        fails a row only when it gave no usable answer (`errors.SystemFailed`), never because its answer was
+        bad."""
 
     @abc.abstractmethod
     def summarize(self, lines: Sequence[Line]) -> Summary:
@@ -189,7 +192,8 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         "row" (if any), ...the result's values}`, without its status: a summary is the same whether a row failed
         or answered as badly as possible.
 
-        Return the scorer's numbers, `headline` among them; any key but those the core writes (`FRAME`)."""
+        Return the scorer's numbers, `headline` among them; any key but those the core writes (`FRAME`). It is
+        called twice: over every row for the summary, and over the scored rows alone for its `answered`."""
 
     def check_gold(self, rows: Sequence[R]) -> None:
         """Refuses, before any call, a dataset whose gold this scorer can't read. Reads every gold by default."""
@@ -226,7 +230,8 @@ class Scorer[R: data.Row, G, P](abc.ABC):
            scores, scores the rest (`score_all`), and writes their details;
         4. refuses unscored rows, unless `partial`, which fails them;
         5. summarizes every row's line (`summarize`), checks the summary, and adds the core's fields: `rows`,
-           `failed` by cause (`CAUSES`), and `coverage`, the share of rows scored; and
+           `failed` by cause (`CAUSES`), `coverage`, the share of rows scored, and `answered`, the summary of the
+           scored rows alone (None when none was); and
         6. writes scores.jsonl and summary.json, only when grading finishes.
 
         `write=False` writes no results, though it may still rebuild a prediction or fill the cache."""
@@ -271,8 +276,14 @@ class Scorer[R: data.Row, G, P](abc.ABC):
         if unscored and not partial:
             _discard(home)
             raise ValueError(_unfinished(run, [], unscored, brought))
+        _same_keys(type(self).__name__, lines)
         ys = [{k: v for k, v in x.items() if k not in ("status", "cause", "error", "traceback")} for x in lines]
         summary = self._framed(self.summarize(ys), lines, run.name)
+        # Note: the answered rows alone, to tell a bad answer from no answer; a run's numbers are the summary's.
+        scored = [y for x, y in zip(lines, ys, strict=True) if x["status"] == "scored"]
+        answered = self.summarize(scored) if scored else None
+        if answered is not None: _check_summary(type(self).__name__, answered, self.headline)
+        summary["answered"] = answered
         # Note: counts and a few ids, not every id, which a run stopped early would have thousands of.
         if missing or unscored:
             summary["partial"] = {"no_answer": len(missing), "not_scored": len(unscored),
@@ -570,6 +581,20 @@ def ask[I](judge: adapter.Adapter[I], x: I, *, timeout: float = 300.0) -> dict[s
 def coverage(lines: Sequence[Line]) -> float:
     """The share of rows scored: the rest failed, and counted as `score_failure` scored them."""
     return sum(x["status"] == "scored" for x in lines) / len(lines)
+
+
+def _same_keys(name: str, lines: Sequence[Line]) -> None:
+    """Refuses a grading whose failed rows' results hold other keys than its scored rows', which every scored row
+    shares, before `summarize` meets them."""
+    def keys(x: Line) -> frozenset[str]:
+        return frozenset(x) - set(LINE)
+
+    scored = {keys(x) for x in lines if x["status"] == "scored"}
+    if len(scored) != 1: return
+    [want] = scored
+    if bad := next((x for x in lines if x["status"] == "failed" and keys(x) != want), None):
+        raise TypeError(f"{name}.score_failure gave row {bad['id']} the keys {sorted(keys(bad))}, where its scored "
+                        f"rows have {sorted(want)}; give a failure the keys score gives")
 
 
 def _check_summary(name: str, s: Any, headline: str) -> None:
