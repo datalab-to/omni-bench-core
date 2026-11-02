@@ -278,8 +278,7 @@ Grading turns each row into one line of `scores.jsonl`, and all the lines into o
                                                          summarize
                                                              v
            {"rows": 3, "failed": {"system": 1, "unusable": 0, "no_answer": 0, "not_scored": 0},
-            "coverage": 0.667, "headline": 0.333, "headline_is": "exact", "exact": 0.333,
-            "answered": {"exact": 0.5}}
+            "coverage": 0.667, "headline": 0.333, "headline_is": "exact", "exact": 0.333}
 ```
 
 A line is one row's grade. The core writes `id`, `status` and `row` (from `row_fields`), then the row's
@@ -309,10 +308,9 @@ value of the key the scorer's `headline` names, and `headline_is`, that key. It 
 of those keys, or whose headline isn't a number from 0 to 1 where higher is better. How a headline is built is
 the scorer's choice: a mean over rows, a share pooled over characters, tests grouped and averaged.
 
-`answered` is `summarize` again, over the scored rows alone (None when none was): how good the answers were, apart
-from how many there were, so a run with timeouts doesn't read as a model that misses fields. It is for diagnosing
-a system, not for ranking: a system that fails its hardest rows looks better there. The core also refuses a grading
-whose failed rows' results hold other keys than its scored rows', so a `score_failure` out of step with `score` is
+A summary counts failed rows in every number. To see how good the answers were apart from how many there were,
+summarize the lines of `scores.jsonl` whose `status` is `scored`: each line holds its row's numbers. The core also
+refuses a grading whose failed rows' results hold other keys than its scored rows', so a `score_failure` out of step with `score` is
 named as such rather than met as a `KeyError` in `summarize`. `Scorer.grade`, which does all this, can't be overridden.
 
 ### How scoring runs
