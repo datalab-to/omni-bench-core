@@ -115,9 +115,10 @@ class Run:
         versions of the data."""
         assert self.system is not None, "only a run with a system predicts"
         if (said := self.settings()):
-            if (was := said.get("dataset_commit")) and dataset_commit and was != dataset_commit:
-                raise ValueError(f"{self.folder} was run on the dataset at commit {was}, and it is now at {dataset_commit}; "
-                                 "start a new run (leave out resume)")
+            # Note: a dataset that now names no commit is refused too: what it holds can't be known to be the same.
+            if (was := said.get("dataset_commit")) and was != dataset_commit:
+                raise ValueError(f"{self.folder} was run on the dataset at commit {was}, and it is now at "
+                                 f"{dataset_commit or 'no commit'}; start a new run (leave out resume)")
             now = {"timeout_s": timeout, **self._located()}
             if any(said.get(k) != v for k, v in now.items()):
                 write_json(self.folder / "settings.json", {**said, **now})

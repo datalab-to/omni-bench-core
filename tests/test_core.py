@@ -1262,6 +1262,8 @@ def test_a_folder_names_its_commit_and_a_resume_refuses_another(tmp: Path) -> No
     assert json.loads((tmp / "runs" / one / "settings.json").read_text())["dataset_commit"] == "abc123"
     (d / data.COMMIT).write_text("def456")
     refused(b.run, GoldEcho(), tmp / "runs", resume=one, match="at commit abc123, and it is now at def456")
+    (d / data.COMMIT).unlink()
+    refused(b.run, GoldEcho(), tmp / "runs", resume=one, match="at commit abc123, and it is now at no commit")
     (d / data.COMMIT).write_text("two words")
     refused(data.commit, d, d, match="one commit on one line")
 
