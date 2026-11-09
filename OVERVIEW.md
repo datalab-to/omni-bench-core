@@ -234,7 +234,9 @@ wherever the data is read from.
 
 settings.json records the dataset's commit: the Hub's commit for an `hf://` dataset, or, for a folder, the one its
 `COMMIT` file names (one line, written by whatever copied the folder there; a folder without one has no commit).
-Resuming a run refuses a dataset whose commit changed since, so no run answers two versions of the data.
+Resuming a run refuses a dataset whose commit changed since, or that names none now, so no run answers two
+versions of the data. A local copy of an `hf://` dataset resumes a run that read the Hub when its `COMMIT` file
+names the Hub's commit.
 
 ### Scorer
 
