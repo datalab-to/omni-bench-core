@@ -109,15 +109,17 @@ class Run:
     def prepare(self, question: Mapping[str, Any], dataset_commit: str | None, timeout: float,
                 launch: Mapping[str, Any] | None = None) -> None:
         """Makes the run's folders, and writes settings.json before the first call: the question, the dataset's
-        commit (`dataset_commit`, for an `hf://` dataset), the timeout, where the system is (`located`), and the launch
-        (`started`, UTC, and `launch`, the caller's own record of it). A resumed run keeps its first launch's
-        settings.json but the timeout and where the system is, which may change, and refuses a dataset whose commit changed since: its rows would be answered against two
+        commit (`dataset_commit`, for an `hf://` dataset or a folder with a `COMMIT` file), the timeout, where the
+        system is (`located`), and the launch (`started`, UTC, and `launch`, the caller's own record of it). A resumed
+        run keeps its first launch's settings.json but the timeout and where the system is, which may change, and
+        refuses a dataset whose commit changed since, or that names none now: its rows would be answered against two
         versions of the data."""
         assert self.system is not None, "only a run with a system predicts"
         if (said := self.settings()):
-            if (was := said.get("dataset_commit")) and dataset_commit and was != dataset_commit:
-                raise ValueError(f"{self.folder} was run on the dataset at commit {was}, and it is now at {dataset_commit}; "
-                                 "start a new run (leave out resume)")
+            # Note: a dataset that now names no commit is refused too: what it holds can't be known to be the same.
+            if (was := said.get("dataset_commit")) and was != dataset_commit:
+                raise ValueError(f"{self.folder} was run on the dataset at commit {was}, and it is now at "
+                                 f"{dataset_commit or 'no commit'}; start a new run (leave out resume)")
             now = {"timeout_s": timeout, **self._located()}
             if any(said.get(k) != v for k, v in now.items()):
                 write_json(self.folder / "settings.json", {**said, **now})
